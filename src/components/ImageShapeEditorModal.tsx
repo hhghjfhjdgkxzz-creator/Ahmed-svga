@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { 
   X, 
   Check, 
@@ -13,7 +13,8 @@ import {
   Maximize2,
   ZoomIn,
   ZoomOut,
-  Move
+  Move,
+  SunMedium
 } from 'lucide-react';
 import { Language } from '../types';
 
@@ -34,41 +35,24 @@ export const ImageShapeEditorModal: React.FC<ImageShapeEditorModalProps> = ({
   lang,
   onApply
 }) => {
+  // Shape mode: Circle, Rounded corners, or Square
   const [shape, setShape] = useState<ImageShape>('circle');
-  const [cornerRadius, setCornerRadius] = useState<number>(24); // in px or %
-  const [feather, setFeather] = useState<number>(0); // 0 to 50px soft edge fade
+  const [cornerRadius, setCornerRadius] = useState<number>(25); // % from 5 to 50
+  const [opacity, setOpacity] = useState<number>(100); // 0 to 100%
+  const [feather, setFeather] = useState<number>(0); // 0 to 40% soft edge fade
   const [zoom, setZoom] = useState<number>(1);
   const [offsetX, setOffsetX] = useState<number>(0);
   const [offsetY, setOffsetY] = useState<number>(0);
-  const [previewBg, setPreviewBg] = useState<'dark' | 'checker' | 'black' | 'white'>('dark');
+  const [previewBg, setPreviewBg] = useState<'checker' | 'dark' | 'black' | 'white'>('checker');
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const imageObjRef = useRef<HTMLImageElement | null>(null);
   const isDraggingRef = useRef(false);
   const dragStartRef = useRef({ x: 0, y: 0 });
+  const animFrameRef = useRef<number | null>(null);
 
-  // Load Image
-  useEffect(() => {
-    if (!isOpen || !imageUrl) return;
-
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.onload = () => {
-      imageObjRef.current = img;
-      renderCanvas();
-    };
-    img.src = imageUrl;
-  }, [isOpen, imageUrl]);
-
-  // Re-render canvas on changes
-  useEffect(() => {
-    if (imageObjRef.current) {
-      renderCanvas();
-    }
-  }, [shape, cornerRadius, feather, zoom, offsetX, offsetY, previewBg]);
-
-  const renderCanvas = (targetCanvas?: HTMLCanvasElement, exportSize = 512): string => {
+  const renderCanvas = useCallback((targetCanvas?: HTMLCanvasElement, exportSize = 600): string => {
     const canvas = targetCanvas || canvasRef.current;
     const img = imageObjRef.current;
     if (!canvas || !img) return '';
@@ -79,27 +63,45 @@ export const ImageShapeEditorModal: React.FC<ImageShapeEditorModalProps> = ({
     const ctx = canvas.getContext('2d');
     if (!ctx) return '';
 
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
     ctx.clearRect(0, 0, size, size);
 
-    // Save state for clipping
+    // Save state for clipping and alpha
     ctx.save();
 
-    // 1. Define clipping shape
+    // 1. Define clipping shape with anti-aliasing
     ctx.beginPath();
     if (shape === 'circle') {
       const radius = size / 2;
-      ctx.arc(radius, radius, radius, 0, Math.PI * 2);
+      ctx.arc(radius, radius, radius - 0.5, 0, Math.PI * 2);
     } else if (shape === 'rounded') {
-      const r = (cornerRadius / 100) * (size / 2);
-      ctx.roundRect(0, 0, size, size, Math.max(4, r));
+      const r = Math.max(8, (cornerRadius / 100) * (size / 2));
+      if (typeof ctx.roundRect === 'function') {
+        ctx.roundRect(0, 0, size, size, r);
+      } else {
+        // Fallback for browsers without native roundRect
+        ctx.moveTo(r, 0);
+        ctx.lineTo(size - r, 0);
+        ctx.quadraticCurveTo(size, 0, size, r);
+        ctx.lineTo(size, size - r);
+        ctx.quadraticCurveTo(size, size, size - r, size);
+        ctx.lineTo(r, size);
+        ctx.quadraticCurveTo(0, size, 0, size - r);
+        ctx.lineTo(0, r);
+        ctx.quadraticCurveTo(0, 0, r, 0);
+      }
     } else {
       ctx.rect(0, 0, size, size);
     }
     ctx.closePath();
     ctx.clip();
 
-    // 2. Draw Image with zoom and pan
-    const imgAspect = img.width / img.height;
+    // 2. Apply opacity to the image itself (does NOT affect the surrounding UI)
+    ctx.globalAlpha = Math.max(0.05, Math.min(1, opacity / 100));
+
+    // 3. Draw Image maintaining aspect ratio, zoom and pan
+    const imgAspect = (img.naturalWidth || img.width) / (img.naturalHeight || img.height);
     let drawW = size * zoom;
     let drawH = size * zoom;
     if (imgAspect > 1) {
@@ -108,12 +110,12 @@ export const ImageShapeEditorModal: React.FC<ImageShapeEditorModalProps> = ({
       drawH = (size / imgAspect) * zoom;
     }
 
-    const drawX = (size - drawW) / 2 + offsetX;
-    const drawY = (size - drawH) / 2 + offsetY;
+    const drawX = (size - drawW) / 2 + offsetX * (size / 280);
+    const drawY = (size - drawH) / 2 + offsetY * (size / 280);
 
     ctx.drawImage(img, drawX, drawY, drawW, drawH);
 
-    // 3. Apply Edge Feather / Soft Fade Transparency
+    // 4. Apply Edge Feather / Soft Fade Transparency if requested
     if (feather > 0) {
       ctx.globalCompositeOperation = 'destination-in';
       const featherGrad = ctx.createRadialGradient(
@@ -125,7 +127,7 @@ export const ImageShapeEditorModal: React.FC<ImageShapeEditorModalProps> = ({
         size / 2
       );
       featherGrad.addColorStop(0, 'rgba(0,0,0,1)');
-      featherGrad.addColorStop(0.7, 'rgba(0,0,0,0.85)');
+      featherGrad.addColorStop(0.75, 'rgba(0,0,0,0.8)');
       featherGrad.addColorStop(1, 'rgba(0,0,0,0)');
 
       ctx.fillStyle = featherGrad;
@@ -134,14 +136,47 @@ export const ImageShapeEditorModal: React.FC<ImageShapeEditorModalProps> = ({
 
     ctx.restore();
 
+    // Export in high-quality WebP format with alpha channel (or PNG fallback)
+    try {
+      const webpUrl = canvas.toDataURL('image/webp', 0.92);
+      if (webpUrl.startsWith('data:image/webp')) {
+        return webpUrl;
+      }
+    } catch {}
     return canvas.toDataURL('image/png');
-  };
+  }, [shape, cornerRadius, opacity, feather, zoom, offsetX, offsetY]);
+
+  // Load image on mount/change
+  useEffect(() => {
+    if (!isOpen || !imageUrl) return;
+
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      imageObjRef.current = img;
+      renderCanvas();
+    };
+    img.src = imageUrl;
+  }, [isOpen, imageUrl, renderCanvas]);
+
+  // Re-render on control change smoothly
+  useEffect(() => {
+    if (imageObjRef.current) {
+      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+      animFrameRef.current = requestAnimationFrame(() => {
+        renderCanvas();
+      });
+    }
+    return () => {
+      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+    };
+  }, [shape, cornerRadius, opacity, feather, zoom, offsetX, offsetY, renderCanvas]);
 
   const handleApply = () => {
     setIsProcessing(true);
     try {
       const offscreen = document.createElement('canvas');
-      const finalDataUrl = renderCanvas(offscreen, 380);
+      const finalDataUrl = renderCanvas(offscreen, 512);
       if (finalDataUrl) {
         onApply(finalDataUrl);
         onClose();
@@ -172,25 +207,30 @@ export const ImageShapeEditorModal: React.FC<ImageShapeEditorModalProps> = ({
 
   return (
     <div 
-      className="fixed inset-0 z-50 flex items-center justify-center p-3 bg-black/85 backdrop-blur-md animate-fade-in"
+      className="fixed inset-0 z-50 flex items-center justify-center p-3 bg-black/85 backdrop-blur-md animate-fade-in select-none"
       onClick={onClose}
     >
       <div 
-        className="relative w-full max-w-2xl rounded-3xl bg-[#0f131d] border border-slate-700 shadow-2xl p-5 sm:p-7 overflow-hidden text-slate-100 flex flex-col max-h-[92vh]"
+        className="relative w-full max-w-2xl rounded-3xl bg-[#0f131d] border border-cyan-500/30 shadow-2xl p-4 sm:p-6 overflow-hidden text-slate-100 flex flex-col max-h-[94vh]"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
         <div className="flex items-center justify-between pb-3 border-b border-slate-800">
           <div className="flex items-center gap-2.5">
-            <div className="w-10 h-10 rounded-xl bg-cyan-500/20 border border-cyan-500/40 flex items-center justify-center text-cyan-300">
+            <div className="w-10 h-10 rounded-2xl bg-cyan-500/20 border border-cyan-500/40 flex items-center justify-center text-cyan-300 shadow-md shadow-cyan-500/20">
               <Sparkles className="w-5 h-5" />
             </div>
             <div>
-              <h3 className="text-base font-bold text-white">
-                {lang === 'ar' ? 'تشكيل وتعديل صورة الغلاف (قص دائري / حواف ناعمة)' : 'Image Shape & Edge Editor'}
+              <h3 className="text-base font-bold text-white flex items-center gap-2">
+                <span>{lang === 'ar' ? 'معاينة وتشكيل لقطة الصورة' : 'Image Shape & Opacity Editor'}</span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-mono">
+                  WebP HD
+                </span>
               </h3>
               <p className="text-[11px] text-slate-400">
-                {lang === 'ar' ? 'اختر الشكل (دائري / حواف دائرية / مربع) وتحكم في شفافية وتلاشي الحواف بدقة' : 'Crop into circle, rounded corners, or square with soft feathered edges'}
+                {lang === 'ar' 
+                  ? 'اختر شكل العرض (دائري / حواف دائرية) مع التحكم في شفافية الصورة والحواف بدقة' 
+                  : 'Customize shape (circle / rounded) and image opacity with instant preview'}
               </p>
             </div>
           </div>
@@ -203,11 +243,11 @@ export const ImageShapeEditorModal: React.FC<ImageShapeEditorModalProps> = ({
         </div>
 
         {/* Content Area */}
-        <div className="flex-1 overflow-y-auto py-4 grid grid-cols-1 md:grid-cols-2 gap-5 items-center">
+        <div className="flex-1 overflow-y-auto py-3 grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-5 items-center">
           {/* Canvas Live Preview */}
-          <div className="flex flex-col items-center justify-center space-y-3">
+          <div className="flex flex-col items-center justify-center space-y-2.5">
             <div 
-              className={`relative w-64 h-64 sm:w-72 sm:h-72 rounded-2xl border-2 border-dashed border-cyan-500/40 overflow-hidden flex items-center justify-center cursor-grab active:cursor-grabbing shadow-2xl select-none ${
+              className={`relative w-64 h-64 sm:w-72 sm:h-72 rounded-2xl border-2 border-dashed border-cyan-500/50 overflow-hidden flex items-center justify-center cursor-grab active:cursor-grabbing shadow-2xl select-none ${
                 previewBg === 'checker' ? 'bg-[linear-gradient(45deg,#1e2433_25%,transparent_25%),linear-gradient(-45deg,#1e2433_25%,transparent_25%),linear-gradient(45deg,transparent_75%,#1e2433_75%),linear-gradient(-45deg,transparent_75%,#1e2433_75%)] bg-[size:16px_16px] bg-[#0c1017]' :
                 previewBg === 'black' ? 'bg-black' :
                 previewBg === 'white' ? 'bg-white' : 'bg-[#090c12]'
@@ -222,7 +262,7 @@ export const ImageShapeEditorModal: React.FC<ImageShapeEditorModalProps> = ({
                 className="w-full h-full object-contain pointer-events-none drop-shadow-2xl"
               />
 
-              <div className="absolute bottom-2 left-2 px-2 py-0.5 rounded bg-black/70 backdrop-blur text-[10px] text-slate-300 pointer-events-none flex items-center gap-1">
+              <div className="absolute bottom-2 left-2 px-2 py-0.5 rounded-lg bg-black/75 backdrop-blur text-[10px] text-slate-300 pointer-events-none flex items-center gap-1 border border-slate-700/60">
                 <Move className="w-3 h-3 text-cyan-400" />
                 <span>{lang === 'ar' ? 'اسحب للتحريك' : 'Drag to reposition'}</span>
               </div>
@@ -230,8 +270,8 @@ export const ImageShapeEditorModal: React.FC<ImageShapeEditorModalProps> = ({
 
             {/* Preview Backdrop Selector */}
             <div className="flex items-center gap-1.5 bg-slate-900/90 p-1 rounded-xl border border-slate-800 text-[11px]">
-              <span className="text-slate-400 px-1.5">{lang === 'ar' ? 'الخلفية:' : 'BG:'}</span>
-              {(['dark', 'checker', 'black', 'white'] as const).map((bg) => (
+              <span className="text-slate-400 px-1.5">{lang === 'ar' ? 'خلفية المعاينة:' : 'BG:'}</span>
+              {(['checker', 'dark', 'black', 'white'] as const).map((bg) => (
                 <button
                   key={bg}
                   type="button"
@@ -242,8 +282,8 @@ export const ImageShapeEditorModal: React.FC<ImageShapeEditorModalProps> = ({
                       : 'text-slate-400 hover:text-white'
                   }`}
                 >
-                  {bg === 'dark' ? (lang === 'ar' ? 'داكن' : 'Dark') :
-                   bg === 'checker' ? (lang === 'ar' ? 'شفاف' : 'Checker') :
+                  {bg === 'checker' ? (lang === 'ar' ? 'مفرغ (شفاف)' : 'Checker') :
+                   bg === 'dark' ? (lang === 'ar' ? 'داكن' : 'Dark') :
                    bg === 'black' ? (lang === 'ar' ? 'أسود' : 'Black') :
                    (lang === 'ar' ? 'أبيض' : 'White')}
                 </button>
@@ -252,64 +292,51 @@ export const ImageShapeEditorModal: React.FC<ImageShapeEditorModalProps> = ({
           </div>
 
           {/* Controls Panel */}
-          <div className="space-y-4 bg-slate-900/80 p-4 rounded-2xl border border-slate-800">
+          <div className="space-y-3 bg-slate-900/80 p-3.5 sm:p-4 rounded-2xl border border-slate-800">
             {/* 1. Shape Selection */}
             <div>
-              <label className="block text-xs font-bold text-slate-200 mb-2">
-                {lang === 'ar' ? '1. اختر شكل الصورة المطلوب:' : '1. Select Shape:'}
+              <label className="block text-xs font-bold text-slate-200 mb-1.5">
+                {lang === 'ar' ? '1. شكل الصورة المطلوب:' : '1. Select Shape:'}
               </label>
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-2 gap-2">
                 <button
                   type="button"
                   onClick={() => setShape('circle')}
-                  className={`p-2.5 rounded-xl border flex flex-col items-center gap-1.5 text-xs font-bold transition-all cursor-pointer ${
+                  className={`p-2.5 rounded-xl border flex items-center justify-center gap-2 text-xs font-bold transition-all cursor-pointer ${
                     shape === 'circle'
-                      ? 'bg-cyan-500/20 border-cyan-400 text-cyan-300 shadow-md shadow-cyan-500/20'
+                      ? 'bg-gradient-to-r from-cyan-600/30 to-blue-600/30 border-cyan-400 text-cyan-300 shadow-md shadow-cyan-500/20'
                       : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700'
                   }`}
                 >
-                  <Circle className="w-5 h-5 text-cyan-400" />
-                  <span>{lang === 'ar' ? 'دائري (Circle)' : 'Circle'}</span>
+                  <Circle className="w-4 h-4 text-cyan-400" />
+                  <span>{lang === 'ar' ? 'دائري بالكامل' : 'Full Circle'}</span>
                 </button>
 
                 <button
                   type="button"
                   onClick={() => setShape('rounded')}
-                  className={`p-2.5 rounded-xl border flex flex-col items-center gap-1.5 text-xs font-bold transition-all cursor-pointer ${
+                  className={`p-2.5 rounded-xl border flex items-center justify-center gap-2 text-xs font-bold transition-all cursor-pointer ${
                     shape === 'rounded'
-                      ? 'bg-cyan-500/20 border-cyan-400 text-cyan-300 shadow-md shadow-cyan-500/20'
+                      ? 'bg-gradient-to-r from-cyan-600/30 to-blue-600/30 border-cyan-400 text-cyan-300 shadow-md shadow-cyan-500/20'
                       : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700'
                   }`}
                 >
-                  <div className="w-5 h-5 rounded-md border-2 border-cyan-400" />
-                  <span>{lang === 'ar' ? 'حواف دائرية' : 'Rounded'}</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setShape('square')}
-                  className={`p-2.5 rounded-xl border flex flex-col items-center gap-1.5 text-xs font-bold transition-all cursor-pointer ${
-                    shape === 'square'
-                      ? 'bg-cyan-500/20 border-cyan-400 text-cyan-300 shadow-md shadow-cyan-500/20'
-                      : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700'
-                  }`}
-                >
-                  <Square className="w-5 h-5 text-cyan-400" />
-                  <span>{lang === 'ar' ? 'مربع أصلي' : 'Square'}</span>
+                  <div className="w-4 h-4 rounded-md border-2 border-cyan-400" />
+                  <span>{lang === 'ar' ? 'مربع بحواف دائرية' : 'Rounded Corners'}</span>
                 </button>
               </div>
             </div>
 
             {/* Corner Radius Slider (If Rounded) */}
             {shape === 'rounded' && (
-              <div className="space-y-1.5 p-3 rounded-xl bg-slate-950/70 border border-slate-800">
+              <div className="space-y-1 p-2.5 rounded-xl bg-slate-950/70 border border-slate-800">
                 <div className="flex justify-between text-xs font-semibold text-slate-300">
-                  <span>{lang === 'ar' ? 'درجة استدارة الحواف:' : 'Corner Radius:'}</span>
+                  <span>{lang === 'ar' ? 'درجة انحناء الحواف:' : 'Corner Radius:'}</span>
                   <span className="font-mono text-cyan-400">{cornerRadius}%</span>
                 </div>
                 <input
                   type="range"
-                  min="4"
+                  min="5"
                   max="50"
                   value={cornerRadius}
                   onChange={(e) => setCornerRadius(Number(e.target.value))}
@@ -318,41 +345,60 @@ export const ImageShapeEditorModal: React.FC<ImageShapeEditorModalProps> = ({
               </div>
             )}
 
-            {/* 2. Edge Feather & Transparency (شفافية وتلاشي الحواف) */}
-            <div className="space-y-1.5 p-3 rounded-xl bg-slate-950/70 border border-slate-800">
+            {/* 2. Image Opacity Control (التحكم في شفافية الصورة) */}
+            <div className="space-y-1 p-2.5 rounded-xl bg-slate-950/70 border border-slate-800">
               <div className="flex justify-between text-xs font-semibold text-slate-300">
-                <span className="flex items-center gap-1 text-emerald-300">
-                  <Sparkles className="w-3.5 h-3.5" />
-                  <span>{lang === 'ar' ? 'شفافية وتلاشي الحواف (Feather Edge):' : 'Edge Feather & Fade:'}</span>
+                <span className="flex items-center gap-1.5 text-cyan-300">
+                  <SunMedium className="w-3.5 h-3.5 text-cyan-400" />
+                  <span>{lang === 'ar' ? 'شفافية الصورة (Image Opacity):' : 'Image Opacity:'}</span>
+                </span>
+                <span className="font-mono text-cyan-400">{opacity}%</span>
+              </div>
+              <input
+                type="range"
+                min="10"
+                max="100"
+                value={opacity}
+                onChange={(e) => setOpacity(Number(e.target.value))}
+                className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-cyan-400"
+              />
+              <p className="text-[10px] text-slate-400">
+                {lang === 'ar'
+                  ? 'يتم تطبيق الشفافية مباشرة على الصورة لتندمج بسلاسة داخل البطاقة'
+                  : 'Adjusts alpha transparency directly on the image layer'}
+              </p>
+            </div>
+
+            {/* 3. Edge Feather & Transparency (شفافية وتلاشي الحواف) */}
+            <div className="space-y-1 p-2.5 rounded-xl bg-slate-950/70 border border-slate-800">
+              <div className="flex justify-between text-xs font-semibold text-slate-300">
+                <span className="flex items-center gap-1.5 text-emerald-300">
+                  <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>{lang === 'ar' ? 'تلاشي ودمج الحواف (Edge Feather):' : 'Edge Feather & Blend:'}</span>
                 </span>
                 <span className="font-mono text-emerald-400">{feather}%</span>
               </div>
               <input
                 type="range"
                 min="0"
-                max="45"
+                max="40"
                 value={feather}
                 onChange={(e) => setFeather(Number(e.target.value))}
                 className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-emerald-400"
               />
-              <p className="text-[10px] text-slate-400">
-                {lang === 'ar'
-                  ? 'يمنح أطراف الصورة تدرجاً شفافاً ناعماً يمتزج بشكل جذاب داخل المتجر'
-                  : 'Softens and blends outer edges smoothly with background'}
-              </p>
             </div>
 
-            {/* 3. Zoom & Pan Controls */}
-            <div className="space-y-1.5 p-3 rounded-xl bg-slate-950/70 border border-slate-800">
+            {/* 4. Zoom & Pan Controls */}
+            <div className="space-y-1 p-2.5 rounded-xl bg-slate-950/70 border border-slate-800">
               <div className="flex justify-between text-xs font-semibold text-slate-300">
                 <span>{lang === 'ar' ? 'تكبير وتصغير (Zoom):' : 'Zoom:'}</span>
-                <span className="font-mono text-cyan-400">{zoom.toFixed(1)}x</span>
+                <span className="font-mono text-cyan-400">{zoom.toFixed(2)}x</span>
               </div>
               <div className="flex items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => setZoom(Math.max(0.5, zoom - 0.1))}
-                  className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
+                  onClick={() => setZoom(Math.max(0.5, Number((zoom - 0.1).toFixed(2))))}
+                  className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 cursor-pointer"
                 >
                   <ZoomOut className="w-4 h-4" />
                 </button>
@@ -367,8 +413,8 @@ export const ImageShapeEditorModal: React.FC<ImageShapeEditorModalProps> = ({
                 />
                 <button
                   type="button"
-                  onClick={() => setZoom(Math.min(3, zoom + 0.1))}
-                  className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
+                  onClick={() => setZoom(Math.min(3, Number((zoom + 0.1).toFixed(2))))}
+                  className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 cursor-pointer"
                 >
                   <ZoomIn className="w-4 h-4" />
                 </button>
@@ -380,16 +426,17 @@ export const ImageShapeEditorModal: React.FC<ImageShapeEditorModalProps> = ({
               type="button"
               onClick={() => {
                 setShape('circle');
-                setCornerRadius(24);
+                setCornerRadius(25);
+                setOpacity(100);
                 setFeather(0);
                 setZoom(1);
                 setOffsetX(0);
                 setOffsetY(0);
               }}
-              className="w-full py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white text-xs flex items-center justify-center gap-1.5 transition-colors"
+              className="w-full py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white text-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
             >
               <RotateCcw className="w-3.5 h-3.5" />
-              <span>{lang === 'ar' ? 'إعادة ضبط الأبعاد' : 'Reset Controls'}</span>
+              <span>{lang === 'ar' ? 'إعادة ضبط الإعدادات' : 'Reset Controls'}</span>
             </button>
           </div>
         </div>

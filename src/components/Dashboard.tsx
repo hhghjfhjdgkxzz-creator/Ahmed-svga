@@ -1404,15 +1404,16 @@ export const Dashboard: React.FC<DashboardProps> = ({
       }
 
       if (capturedDataUrl) {
-        // Automatically populate the Poster Image box and enable it
+        // Automatically populate the Poster Image box, enable it, and open shape editor modal
         setPosterUrl(capturedDataUrl);
         setUsePosterImage(true);
         setPosterLoadError(false);
         setShapeEditorImage(capturedDataUrl);
+        setIsShapeEditorOpen(true);
         setSuccessMessage(
           lang === 'ar'
-            ? `✓ تم التقاط لقطة الفيديو بنجاح وحفظها بصيغة WebP خفيفة وفائقة السرعة!`
-            : `✓ Video snapshot captured successfully in ultra-lightweight WebP format!`
+            ? `✓ تم التقاط لقطة الفيديو بنجاح! تم فتح نافذة المعاينة لاختيار الشكل والشفافية.`
+            : `✓ Video snapshot captured! Preview modal opened for shape & opacity adjustment.`
         );
         setTimeout(() => setSuccessMessage(null), 5000);
       } else {
