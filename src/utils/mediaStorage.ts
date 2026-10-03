@@ -291,14 +291,22 @@ export async function uploadDataUrlOrFile(
 }
 
 /**
- * Resolves a media URL to an absolute or playable stream URL directly from the source CDN/Storage.
+ * Media Compatibility Layer:
+ * Resolves any legacy or modern media URL to a direct, playable URL from the browser.
  * Vercel is 100% excluded: browser connects directly to external storage / CDN hosts.
  */
-export function resolveMediaUrl(url?: string, _useProxy = false): string {
+export function getPlayableMediaUrl(url?: string): string {
   if (!url) return '';
-  const trimmed = url.trim();
+  let trimmed = url.trim();
+
+  // Return local blob / data / relative static URLs immediately
   if (trimmed.startsWith('/uploads/') || trimmed.startsWith('blob:') || trimmed.startsWith('data:')) {
     return trimmed;
+  }
+
+  // Mixed-content protection: Upgrade insecure http:// to https:// for modern browser compliance
+  if (trimmed.startsWith('http://') && !trimmed.includes('localhost') && !trimmed.includes('127.0.0.1')) {
+    trimmed = trimmed.replace(/^http:\/\//i, 'https://');
   }
 
   // Handle Google Drive view links -> convert to direct thumbnail/image links
@@ -307,9 +315,16 @@ export function resolveMediaUrl(url?: string, _useProxy = false): string {
     return `https://lh3.googleusercontent.com/d/${gdriveMatch[1]}`;
   }
 
-  // Handle Dropbox share links -> convert to direct raw links
+  // Handle Dropbox share links -> convert to direct raw stream links
   if (trimmed.includes('dropbox.com')) {
     return trimmed.replace('www.dropbox.com', 'dl.dropboxusercontent.com').replace(/\?dl=[01]/, '');
+  }
+
+  // Clean URL spaces if present in file path
+  if (trimmed.includes(' ') && !trimmed.includes('%20')) {
+    try {
+      trimmed = encodeURI(trimmed);
+    } catch {}
   }
 
   // Return direct CDN / external video URL directly to the browser
@@ -317,9 +332,16 @@ export function resolveMediaUrl(url?: string, _useProxy = false): string {
 }
 
 /**
+ * Resolves a media URL to an absolute or playable stream URL directly from the source CDN/Storage.
+ * Alias for getPlayableMediaUrl.
+ */
+export function resolveMediaUrl(url?: string, _useProxy = false): string {
+  return getPlayableMediaUrl(url);
+}
+
+/**
  * Returns direct URL for browser native playback without passing through Vercel
  */
 export function getProxyMediaUrl(url: string): string {
-  if (!url) return '';
-  return resolveMediaUrl(url);
+  return getPlayableMediaUrl(url);
 }

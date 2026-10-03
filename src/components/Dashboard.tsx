@@ -3137,7 +3137,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
                         loop
                         muted
                         playsInline
-                        crossOrigin="anonymous"
+                        preload="metadata"
                         onLoadedData={() => setVideoTestError(false)}
                         onCanPlay={() => {
                           setVideoTestError(false);

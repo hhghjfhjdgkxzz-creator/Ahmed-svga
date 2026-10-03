@@ -18,7 +18,7 @@ import {
 import { GiftItem, Language } from '../types';
 import { translations } from '../utils/translations';
 import { SvgaPlayer } from './SvgaPlayer';
-import { resolveMediaUrl, getMediaFromIndexedDb, getProxyMediaUrl } from '../utils/mediaStorage';
+import { resolveMediaUrl, getMediaFromIndexedDb, getProxyMediaUrl, getPlayableMediaUrl } from '../utils/mediaStorage';
 
 interface GiftModalProps {
   gift: GiftItem | null;
@@ -55,33 +55,28 @@ export const GiftModal: React.FC<GiftModalProps> = ({
 
     setHasVideoError(false);
     setCurrentTime(0);
-    setIsMuted(false);
+    setIsMuted(true);
 
-    const initialUrl = resolveMediaUrl(gift.videoUrl);
+    const initialUrl = getPlayableMediaUrl(gift.videoUrl);
     setVideoSrc(initialUrl);
 
     const timer = setTimeout(() => {
       if (videoRef.current) {
         videoRef.current.currentTime = 0;
-        videoRef.current.muted = false;
-        setIsMuted(false);
+        videoRef.current.muted = true;
         videoRef.current.play().then(() => {
           setIsPlaying(true);
         }).catch((err) => {
-          console.warn('Unmuted autoplay prevented by browser gesture policy, falling back to muted autoplay:', err);
-          if (videoRef.current) {
-            videoRef.current.muted = true;
-            setIsMuted(true);
-            videoRef.current.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
-          }
+          console.warn('Autoplay prevented:', err);
+          setIsPlaying(false);
         });
       }
-    }, 100);
+    }, 50);
 
     return () => clearTimeout(timer);
   }, [gift]);
 
-  // If video fails to load, try recovery from IndexedDB or Proxy
+  // If video fails to load, try recovery from IndexedDB
   const handleVideoError = async () => {
     if (!gift) return;
     try {
@@ -94,6 +89,14 @@ export const GiftModal: React.FC<GiftModalProps> = ({
         setTimeout(() => {
           videoRef.current?.play().catch(() => {});
         }, 100);
+        return;
+      }
+
+      // 2. If videoSrc wasn't the clean playable URL, try it directly
+      const cleanUrl = getPlayableMediaUrl(gift.videoUrl);
+      if (cleanUrl && videoSrc !== cleanUrl) {
+        setVideoSrc(cleanUrl);
+        setHasVideoError(false);
         return;
       }
     } catch (e) {
@@ -310,14 +313,13 @@ export const GiftModal: React.FC<GiftModalProps> = ({
                   <video
                     ref={videoRef}
                     key={videoSrc || gift.videoUrl}
-                    src={videoSrc || gift.videoUrl}
-                    poster={gift.posterUrl ? resolveMediaUrl(gift.posterUrl) : undefined}
+                    src={videoSrc || getPlayableMediaUrl(gift.videoUrl)}
+                    poster={gift.posterUrl ? getPlayableMediaUrl(gift.posterUrl) : undefined}
                     loop
                     autoPlay={isPlaying}
                     muted={isMuted}
                     playsInline
-                    crossOrigin="anonymous"
-                    preload="auto"
+                    preload="metadata"
                     onTimeUpdate={handleTimeUpdate}
                     onLoadedMetadata={() => {
                       if (videoRef.current && videoRef.current.duration) {

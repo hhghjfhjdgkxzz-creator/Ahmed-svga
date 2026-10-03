@@ -157,8 +157,7 @@ export const SvgaPlayerModal: React.FC<SvgaPlayerModalProps> = ({
                     autoPlay={isPlaying}
                     muted={isMuted}
                     playsInline
-                    crossOrigin="anonymous"
-                    preload="auto"
+                    preload="metadata"
                     onTimeUpdate={() => {
                       if (videoRef.current) {
                         const cur = videoRef.current.currentTime;

@@ -1,0 +1,12 @@
+{
+  "botToken": "YOUR_TELEGRAM_BOT_TOKEN_HERE",
+  "chatId": "YOUR_CHAT_ID_HERE",
+  "ownerPhone": "",
+  "ownerName": "Admin",
+  "groupTarget": "",
+  "sendMode": "personal",
+  "botUsername": "",
+  "enabled": false,
+  "destinationAccount": "",
+  "ignoreAdminUploads": false
+}
