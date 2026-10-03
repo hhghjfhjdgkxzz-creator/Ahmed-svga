@@ -179,6 +179,67 @@ app.get('/api/proxy-media', (req: Request, res: Response) => {
   return res.status(404).json({ error: 'Direct CDN playback enabled. Media proxy discontinued.' });
 });
 
+// Snapshot CORS Gateway: Allows client-side canvas video frame capture with Range support
+app.get('/api/snapshot', async (req: Request, res: Response) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+
+  const url = req.query.url as string;
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: 'Missing url parameter' });
+  }
+
+  const cleanUrl = url.trim();
+  if (!cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://')) {
+    return res.status(400).json({ error: 'Only HTTP/HTTPS URLs allowed' });
+  }
+
+  try {
+    const forwardHeaders: Record<string, string> = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      'Accept': '*/*',
+    };
+    if (req.headers.range) {
+      forwardHeaders['Range'] = req.headers.range;
+    }
+
+    const upstream = await fetch(cleanUrl, {
+      method: req.method === 'HEAD' ? 'HEAD' : 'GET',
+      headers: forwardHeaders,
+      redirect: 'follow',
+    });
+
+    res.status(upstream.status || 200);
+    const contentType = upstream.headers.get('content-type') || 'video/mp4';
+    res.setHeader('Content-Type', contentType);
+
+    const contentRange = upstream.headers.get('content-range');
+    if (contentRange) res.setHeader('Content-Range', contentRange);
+
+    const contentLength = upstream.headers.get('content-length');
+    if (contentLength) res.setHeader('Content-Length', contentLength);
+
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+
+    if (req.method === 'HEAD' || !upstream.body) {
+      return res.end();
+    }
+
+    const nodeStream = Readable.fromWeb(upstream.body as any);
+    nodeStream.on('error', () => {
+      if (!res.headersSent) res.status(500).end();
+    });
+    nodeStream.pipe(res);
+  } catch (err: any) {
+    if (!res.headersSent) {
+      res.status(502).json({ error: 'Failed to fetch snapshot stream', details: err?.message });
+    }
+  }
+});
+
 async function startServer() {
   if (!isProd) {
     // Development mode with Vite Middleware

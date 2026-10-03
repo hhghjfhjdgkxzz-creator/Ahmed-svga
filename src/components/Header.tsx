@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, memo } from 'react';
 import { 
   Search, 
   ShoppingCart, 
@@ -42,7 +42,7 @@ export interface HeaderProps {
   onOpenSiteSettings?: () => void;
 }
 
-export const Header: React.FC<HeaderProps> = ({
+const HeaderComponent: React.FC<HeaderProps> = ({
   lang,
   setLang,
   searchQuery,
@@ -293,6 +293,9 @@ export const Header: React.FC<HeaderProps> = ({
               ) && (
                 <button
                   onClick={handleDashboardToggle}
+                  onMouseEnter={() => {
+                    import('./Dashboard').catch(() => {});
+                  }}
                   className={`p-2 sm:px-2.5 sm:py-1.5 rounded-xl text-xs font-semibold border transition-all flex items-center gap-1 cursor-pointer ${
                     currentView === 'dashboard'
                       ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-300'
@@ -368,3 +371,5 @@ export const Header: React.FC<HeaderProps> = ({
     </>
   );
 };
+
+export const Header = memo(HeaderComponent);

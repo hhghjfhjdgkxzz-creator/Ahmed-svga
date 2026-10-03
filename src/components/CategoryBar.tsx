@@ -1,4 +1,4 @@
-import React, { useRef } from 'react';
+import React, { useRef, useMemo, memo } from 'react';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { Language } from '../types';
 
@@ -16,7 +16,7 @@ interface CategoryBarProps {
   lang: Language;
 }
 
-export const CategoryBar: React.FC<CategoryBarProps> = ({
+const CategoryBarComponent: React.FC<CategoryBarProps> = ({
   selectedCategory,
   onSelectCategory,
   categories = [],
@@ -24,7 +24,7 @@ export const CategoryBar: React.FC<CategoryBarProps> = ({
 }) => {
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
 
-  const defaultCategories: CategoryItem[] = [
+  const defaultCategories: CategoryItem[] = useMemo(() => [
     { id: 'all', name: 'All Categories', nameAr: 'كافة التصنيفات', nameEn: 'All Categories' },
     { id: 'frames', name: 'Avatar Frames', nameAr: 'إطارات الأفاتار', nameEn: 'Avatar Frames' },
     { id: 'medals', name: 'Medals & Badges', nameAr: 'الأوسمة والشارات', nameEn: 'Medals & Badges' },
@@ -37,19 +37,22 @@ export const CategoryBar: React.FC<CategoryBarProps> = ({
     { id: 'romance', name: 'Romance', nameAr: 'رومانسي وعشاق', nameEn: 'Romance' },
     { id: 'tech', name: 'Tech & Sci-Fi', nameAr: 'خيال علمي وميكا', nameEn: 'Tech & Sci-Fi' },
     { id: 'general', name: 'Featured VFX', nameAr: 'مؤثرات عامة', nameEn: 'Featured VFX' },
-  ];
+  ], []);
 
-  const mergedCategories: CategoryItem[] = [...defaultCategories];
-  (Array.isArray(categories) ? categories : []).forEach((cat) => {
-    if (cat && !mergedCategories.some((c) => c.id === cat.id)) {
-      mergedCategories.push({
-        id: cat.id,
-        name: cat.name,
-        nameAr: cat.nameAr || cat.name,
-        nameEn: cat.nameEn || cat.name
-      });
-    }
-  });
+  const mergedCategories: CategoryItem[] = useMemo(() => {
+    const list = [...defaultCategories];
+    (Array.isArray(categories) ? categories : []).forEach((cat) => {
+      if (cat && !list.some((c) => c.id === cat.id)) {
+        list.push({
+          id: cat.id,
+          name: cat.name,
+          nameAr: cat.nameAr || cat.name,
+          nameEn: cat.nameEn || cat.name
+        });
+      }
+    });
+    return list;
+  }, [categories, defaultCategories]);
 
   const getDisplayName = (item: CategoryItem) => {
     if (lang === 'ar' && item.nameAr) return item.nameAr;
@@ -110,3 +113,5 @@ export const CategoryBar: React.FC<CategoryBarProps> = ({
     </div>
   );
 };
+
+export const CategoryBar = memo(CategoryBarComponent);

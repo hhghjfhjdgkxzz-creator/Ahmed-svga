@@ -1277,7 +1277,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
     }
     const targetTime = vid ? (vid.currentTime || 0) : videoScrubTime || 0;
 
-    // Helper: draw video element to canvas and return compact base64
+    // Helper: draw video element to canvas and return compact WebP base64
     const drawVideoToDataUrl = (targetVideo: HTMLVideoElement): string => {
       const maxDim = 400;
       let w = targetVideo.videoWidth || 720;
@@ -1297,7 +1297,15 @@ export const Dashboard: React.FC<DashboardProps> = ({
       const ctx = canvas.getContext('2d');
       if (!ctx) throw new Error('Cannot get canvas context');
       ctx.drawImage(targetVideo, 0, 0, canvas.width, canvas.height);
-      return canvas.toDataURL('image/jpeg', 0.78);
+
+      // Export as WebP for ultra-lightweight size as requested ("بصيغه الويفي عشان تكون خفيفه")
+      try {
+        const webpData = canvas.toDataURL('image/webp', 0.82);
+        if (webpData.startsWith('data:image/webp')) {
+          return webpData;
+        }
+      } catch {}
+      return canvas.toDataURL('image/jpeg', 0.80);
     };
 
     try {
@@ -1308,11 +1316,47 @@ export const Dashboard: React.FC<DashboardProps> = ({
         try {
           capturedDataUrl = drawVideoToDataUrl(vid);
         } catch (directErr) {
-          console.warn('Direct canvas draw tainted by CORS. Trying proxy fallback...', directErr);
+          console.warn('Direct canvas draw tainted by CORS. Trying snapshot gateway...', directErr);
         }
       }
 
-      // Attempt 2: If direct capture failed or threw SecurityError, try clean blob fetching
+      // Attempt 2: Use CORS snapshot gateway with Range header support
+      if (!capturedDataUrl) {
+        const tempVid = document.createElement('video');
+        tempVid.crossOrigin = 'anonymous';
+        tempVid.muted = true;
+        tempVid.playsInline = true;
+        tempVid.preload = 'auto';
+
+        // Local blob or dedicated snapshot CORS gateway
+        const gatewayUrl = videoUrl.startsWith('blob:') 
+          ? videoUrl 
+          : `/api/snapshot?url=${encodeURIComponent(videoUrl)}`;
+        
+        tempVid.src = gatewayUrl;
+
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error('Video frame capture timeout')), 10000);
+          tempVid.onloadedmetadata = () => {
+            const seekTo = Math.min(targetTime, tempVid.duration || targetTime);
+            tempVid.currentTime = seekTo;
+          };
+          tempVid.onseeked = () => {
+            clearTimeout(timeout);
+            resolve();
+          };
+          tempVid.onerror = (e) => {
+            clearTimeout(timeout);
+            reject(new Error('Failed to load video frame via gateway'));
+          };
+        });
+
+        capturedDataUrl = drawVideoToDataUrl(tempVid);
+        tempVid.src = '';
+        tempVid.remove();
+      }
+
+      // Attempt 3: Direct blob fetch fallback
       if (!capturedDataUrl) {
         let blobUrl = '';
         let isLocalBlob = false;
@@ -1321,35 +1365,14 @@ export const Dashboard: React.FC<DashboardProps> = ({
           blobUrl = videoUrl;
           isLocalBlob = true;
         } else {
-          let blob: Blob | null = null;
-          
-          // Try direct fetch or public client CORS proxy (never touches Vercel)
-          const fetchTargets = [
-            videoUrl, // 1. Direct fetch from external storage
-            `https://corsproxy.io/?${encodeURIComponent(videoUrl)}`, // 2. Public client-side proxy fallback
-            `https://api.allorigins.win/raw?url=${encodeURIComponent(videoUrl)}` // 3. Another public client proxy
-          ];
-
-          for (const targetUrl of fetchTargets) {
-            try {
-              const resp = await fetch(targetUrl, { mode: 'cors' });
-              if (resp.ok) {
-                blob = await resp.blob();
-                break; // Found a working method!
-              }
-            } catch (err) {
-              console.warn(`Fetch method failed for: ${targetUrl}`);
-            }
+          const resp = await fetch(`/api/snapshot?url=${encodeURIComponent(videoUrl)}`);
+          if (!resp.ok) {
+            throw new Error(`Failed to fetch media blob (${resp.status})`);
           }
-
-          if (!blob) {
-            throw new Error(`All fetch methods failed for ${videoUrl}`);
-          }
-          
+          const blob = await resp.blob();
           blobUrl = URL.createObjectURL(blob);
         }
 
-        // Create temporary offscreen video with clean blob
         const tempVid = document.createElement('video');
         tempVid.muted = true;
         tempVid.playsInline = true;
@@ -1357,7 +1380,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
         tempVid.src = blobUrl;
 
         await new Promise<void>((resolve, reject) => {
-          const timeout = setTimeout(() => reject(new Error('Video load timeout')), 8000);
+          const timeout = setTimeout(() => reject(new Error('Blob video timeout')), 8000);
           tempVid.onloadedmetadata = () => {
             tempVid.currentTime = Math.min(targetTime, tempVid.duration || targetTime);
           };
@@ -1376,20 +1399,22 @@ export const Dashboard: React.FC<DashboardProps> = ({
         if (blobUrl && !isLocalBlob) {
           URL.revokeObjectURL(blobUrl);
         }
+        tempVid.src = '';
+        tempVid.remove();
       }
 
       if (capturedDataUrl) {
-        // Automatically populate the Poster Image box, enable it, and open Shape Editor for custom circular/rounded/feather styling!
+        // Automatically populate the Poster Image box and enable it
         setPosterUrl(capturedDataUrl);
         setUsePosterImage(true);
+        setPosterLoadError(false);
         setShapeEditorImage(capturedDataUrl);
-        setIsShapeEditorOpen(true);
         setSuccessMessage(
           lang === 'ar'
-            ? `✓ تم التقاط لقطة الفيديو بنجاح! يمكنك الآن اختيار الشكل (دائري / حواف دائرية) وضبط شفافية وتلاشي الحواف.`
-            : `✓ Snapshot captured! Customize shape (circle/rounded) and edge feathering now.`
+            ? `✓ تم التقاط لقطة الفيديو بنجاح وحفظها بصيغة WebP خفيفة وفائقة السرعة!`
+            : `✓ Video snapshot captured successfully in ultra-lightweight WebP format!`
         );
-        setTimeout(() => setSuccessMessage(null), 6000);
+        setTimeout(() => setSuccessMessage(null), 5000);
       } else {
         throw new Error('Frame extraction returned empty');
       }
@@ -1397,7 +1422,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
       console.warn('Frame capture error:', err);
       alert(
         lang === 'ar'
-          ? '⚠️ تعذر التقاط الصورة تلقائياً من هذا الرابط الخارجي. يمكنك إما رفع ملف الفيديو مباشرة من جهازك عبر زر [رفع ملف فيديو]، أو اختيار صورة جاهزة من جهازك عبر زر [رفع صورة]!'
+          ? '⚠️ تعذر التقاط الصورة تلقائياً من هذا الرابط الخارجي. يمكنك رفع ملف الفيديو من جهازك عبر [رفع ملف فيديو] أو اختيار صورة جاهزة عبر [رفع صورة]!'
           : 'Could not extract frame automatically from this URL. Please use [Upload Video File] or [Upload Image].'
       );
     } finally {

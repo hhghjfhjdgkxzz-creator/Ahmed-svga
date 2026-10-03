@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { memo } from 'react';
 import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Sparkles } from 'lucide-react';
 import { Language } from '../types';
 import { translations } from '../utils/translations';
@@ -7,15 +7,17 @@ interface PaginationProps {
   currentPage: number;
   totalPages: number;
   onPageChange: (page: number) => void;
+  onPrefetchPage?: (page: number) => void;
   lang: Language;
   totalItems?: number;
   itemsPerPage?: number;
 }
 
-export const Pagination: React.FC<PaginationProps> = ({
+const PaginationComponent: React.FC<PaginationProps> = ({
   currentPage,
   totalPages,
   onPageChange,
+  onPrefetchPage,
   lang,
   totalItems,
   itemsPerPage = 26
@@ -98,6 +100,7 @@ export const Pagination: React.FC<PaginationProps> = ({
         <button
           type="button"
           onClick={() => onPageChange(1)}
+          onMouseEnter={() => onPrefetchPage?.(1)}
           disabled={currentPage === 1}
           aria-label={t.paginationFirst}
           title={t.paginationFirst}
@@ -111,6 +114,7 @@ export const Pagination: React.FC<PaginationProps> = ({
         <button
           type="button"
           onClick={() => onPageChange(Math.max(1, currentPage - 1))}
+          onMouseEnter={() => onPrefetchPage?.(Math.max(1, currentPage - 1))}
           disabled={currentPage === 1}
           aria-label={t.paginationPrev}
           title={t.paginationPrev}
@@ -142,6 +146,7 @@ export const Pagination: React.FC<PaginationProps> = ({
                 key={pageNum}
                 type="button"
                 onClick={() => onPageChange(pageNum)}
+                onMouseEnter={() => onPrefetchPage?.(pageNum)}
                 aria-current={isActive ? 'page' : undefined}
                 className={`min-w-[34px] sm:min-w-[38px] h-9 px-2 rounded-xl text-xs font-bold transition-all flex items-center justify-center active:scale-95 touch-manipulation ${
                   isActive
@@ -159,6 +164,7 @@ export const Pagination: React.FC<PaginationProps> = ({
         <button
           type="button"
           onClick={() => onPageChange(Math.min(totalPages, currentPage + 1))}
+          onMouseEnter={() => onPrefetchPage?.(Math.min(totalPages, currentPage + 1))}
           disabled={currentPage === totalPages}
           aria-label={t.paginationNext}
           title={t.paginationNext}
@@ -172,6 +178,7 @@ export const Pagination: React.FC<PaginationProps> = ({
         <button
           type="button"
           onClick={() => onPageChange(totalPages)}
+          onMouseEnter={() => onPrefetchPage?.(totalPages)}
           disabled={currentPage === totalPages}
           aria-label={t.paginationLast}
           title={t.paginationLast}
@@ -185,3 +192,4 @@ export const Pagination: React.FC<PaginationProps> = ({
   );
 };
 
+export const Pagination = memo(PaginationComponent);

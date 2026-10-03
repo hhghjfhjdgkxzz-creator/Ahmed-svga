@@ -1,24 +1,27 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, memo } from 'react';
 import { Play, Video, Volume2, Sparkles, ArrowRight, ArrowLeft } from 'lucide-react';
 import { GiftItem, Language } from '../types';
 import { translations } from '../utils/translations';
 import { SvgaPlayer } from './SvgaPlayer';
-import { resolveMediaUrl, getMediaFromIndexedDb, getProxyMediaUrl } from '../utils/mediaStorage';
+import { resolveMediaUrl, getMediaFromIndexedDb } from '../utils/mediaStorage';
+import { OptimizedImage } from './common/OptimizedImage';
 
-interface GiftCardProps {
+export interface GiftCardProps {
   gift: GiftItem;
   lang: Language;
   onSelectGift: (gift: GiftItem) => void;
   onQuickBuy?: (gift: GiftItem) => void;
   onAddToCart?: (gift: GiftItem) => void;
   isSelected?: boolean;
+  priority?: boolean;
 }
 
-export const GiftCard: React.FC<GiftCardProps> = ({
+const GiftCardComponent: React.FC<GiftCardProps> = ({
   gift,
   lang,
   onSelectGift,
-  isSelected = false
+  isSelected = false,
+  priority = false
 }) => {
   const t = translations[lang];
   const [isHovered, setIsHovered] = useState(false);
@@ -120,18 +123,18 @@ export const GiftCard: React.FC<GiftCardProps> = ({
         </div>
 
         {/* Media Preview:
-            - At rest: Show posterUrl (clean customized cover image)
-            - On Hover: If videoUrl exists, play video/animation immediately on hover!
+            - At rest: Show posterUrl with zero layout shift via OptimizedImage
+            - On Hover: Mount & play video/SVGA dynamically without network socket exhaustion
         */}
         {hasPoster ? (
           <div className="relative w-full h-full flex items-center justify-center">
-            {/* Background Playable Video / SVGA on Hover */}
-            {(isVideo || isSvga || gift.videoUrl) && (
-              <div className={`absolute inset-0 w-full h-full transition-opacity duration-300 ${isHovered ? 'opacity-100 z-10' : 'opacity-0 pointer-events-none'}`}>
+            {/* Background Playable Video / SVGA on Hover only */}
+            {(isVideo || isSvga || gift.videoUrl) && isHovered && (
+              <div className="absolute inset-0 w-full h-full transition-opacity duration-300 opacity-100 z-10">
                 {isSvga ? (
                   <SvgaPlayer
                     src={videoSrc || gift.videoUrl}
-                    autoPlay={isHovered}
+                    autoPlay={true}
                     loop={true}
                     isMuted={true}
                     backdrop="dark"
@@ -141,11 +144,11 @@ export const GiftCard: React.FC<GiftCardProps> = ({
                   <video
                     ref={videoRef}
                     src={videoSrc || resolveMediaUrl(gift.videoUrl)}
-                    autoPlay={isHovered}
+                    autoPlay={true}
                     loop
                     muted
                     playsInline
-                    preload="metadata"
+                    preload="auto"
                     onError={handleVideoError}
                     className="w-full h-full object-contain pointer-events-none drop-shadow-2xl transform-gpu"
                   />
@@ -153,31 +156,20 @@ export const GiftCard: React.FC<GiftCardProps> = ({
               </div>
             )}
 
-            {/* Front Poster Image (Visible when not hovered) */}
-            <img
-              src={resolveMediaUrl(gift.posterUrl)}
-              alt={displayTitle}
-              className={`w-full h-full object-contain pointer-events-none transition-all duration-300 drop-shadow-2xl ${
-                isHovered && (isVideo || isSvga || gift.videoUrl) ? 'opacity-0 scale-105' : 'opacity-100 group-hover:scale-105'
-              }`}
-              loading="lazy"
-              onError={(e) => {
-                const target = e.currentTarget;
-                const raw = gift.posterUrl || '';
-                // If it failed loading a .png, seamlessly try .webp
-                if (target.src.includes('.png') && !target.src.includes('_retry_webp')) {
-                  target.src = target.src.replace(/\.png(\?.*)?$/, '.webp') + '?_retry_webp=1';
-                  return;
-                }
-                // If it failed loading a .webp, try fallback .png
-                if (target.src.includes('.webp') && !target.src.includes('_retry_png')) {
-                  target.src = target.src.replace(/\.webp(\?.*)?$/, '.png') + '?_retry_png=1';
-                  return;
-                }
-              }}
-            />
+            {/* Front Poster Image (Visible at rest, with skeleton & browser cache) */}
+            <div className={`w-full h-full transition-all duration-300 ${
+              isHovered && (isVideo || isSvga || gift.videoUrl) ? 'opacity-0 scale-105' : 'opacity-100 group-hover:scale-105'
+            }`}>
+              <OptimizedImage
+                src={gift.posterUrl}
+                alt={displayTitle}
+                priority={priority}
+                aspectRatioClass="aspect-square"
+                className="w-full h-full object-contain pointer-events-none drop-shadow-2xl"
+              />
+            </div>
           </div>
-        ) : isSvga && gift.videoUrl ? (
+        ) : isHovered && isSvga && gift.videoUrl ? (
           <div className="w-full h-full flex items-center justify-center">
             <SvgaPlayer
               src={videoSrc || gift.videoUrl}
@@ -188,7 +180,7 @@ export const GiftCard: React.FC<GiftCardProps> = ({
               className="w-full h-full object-contain pointer-events-none drop-shadow-2xl"
             />
           </div>
-        ) : (isVideo || gift.videoUrl) && videoSrc && !gift.videoUrl?.match(/\.(jpeg|jpg|gif|png|webp|svg|bmp)(\?.*)?$/i) ? (
+        ) : isHovered && (isVideo || gift.videoUrl) && videoSrc && !gift.videoUrl?.match(/\.(jpeg|jpg|gif|png|webp|svg|bmp)(\?.*)?$/i) ? (
           <video
             ref={videoRef}
             src={videoSrc}
@@ -196,16 +188,17 @@ export const GiftCard: React.FC<GiftCardProps> = ({
             loop
             muted
             playsInline
-            preload="metadata"
+            preload="auto"
             onError={handleVideoError}
             className="w-full h-full object-contain pointer-events-none drop-shadow-2xl transform-gpu"
           />
-        ) : gift.videoUrl ? (
-          <img
-            src={resolveMediaUrl(gift.videoUrl)}
+        ) : gift.videoUrl && gift.videoUrl.match(/\.(jpeg|jpg|gif|png|webp|svg|bmp)(\?.*)?$/i) ? (
+          <OptimizedImage
+            src={gift.videoUrl}
             alt={displayTitle}
-            className="w-full h-full object-contain pointer-events-none transition-transform duration-500 group-hover:scale-105 opacity-100 filter-none drop-shadow-2xl"
-            loading="lazy"
+            priority={priority}
+            aspectRatioClass="aspect-square"
+            className="w-full h-full object-contain pointer-events-none transition-transform duration-500 group-hover:scale-105 filter-none drop-shadow-2xl"
           />
         ) : (
           <div className="w-full h-full flex flex-col items-center justify-center text-slate-500">
@@ -241,3 +234,16 @@ export const GiftCard: React.FC<GiftCardProps> = ({
   );
 };
 
+export const GiftCard = memo(GiftCardComponent, (prev, next) => {
+  return (
+    prev.gift.id === next.gift.id &&
+    prev.gift.posterUrl === next.gift.posterUrl &&
+    prev.gift.videoUrl === next.gift.videoUrl &&
+    prev.gift.price === next.gift.price &&
+    prev.gift.title === next.gift.title &&
+    prev.gift.titleAr === next.gift.titleAr &&
+    prev.isSelected === next.isSelected &&
+    prev.priority === next.priority &&
+    prev.lang === next.lang
+  );
+});

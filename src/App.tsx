@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, Suspense, lazy } from 'react';
 import { GiftItem, Language, CartItem, DeliveryItem, EmployeeUser, AuthUser, HeroBannerItem, SiteSettings } from './types';
 import { INITIAL_EMPLOYEES } from './data/initialEmployees';
 import { INITIAL_BANNERS } from './data/initialBanners';
@@ -8,17 +8,32 @@ import { HeroBanners } from './components/HeroBanners';
 import { CategoryBar } from './components/CategoryBar';
 import { GiftCard } from './components/GiftCard';
 import { Pagination } from './components/Pagination';
-import { GiftModal } from './components/GiftModal';
-import { PurchaseModal } from './components/PurchaseModal';
-import { DeliveryBoxModal } from './components/DeliveryBoxModal';
-import { Dashboard } from './components/Dashboard';
-import { CartDrawer } from './components/CartDrawer';
-import { AuthModal } from './components/AuthModal';
-import { SupportModal } from './components/SupportModal';
-import { VipModal } from './components/VipModal';
-import { SiteSettingsModal } from './components/SiteSettingsModal';
 import { Footer } from './components/Footer';
-import { seedDatabase, subscribeToGifts, subscribeToDeliveries, subscribeToEmployees, subscribeToBanners, addDelivery, purgeDummyGifts, isDummyGift } from './lib/firebaseService';
+import { 
+  seedDatabase, 
+  subscribeToGifts, 
+  subscribeToDeliveries, 
+  subscribeToEmployees, 
+  subscribeToUsers,
+  subscribeToBanners, 
+  subscribeToCategories,
+  subscribeToSiteSettings,
+  addDelivery, 
+  purgeDummyGifts, 
+  isDummyGift 
+} from './lib/firebaseService';
+import { preloadImagesBatch } from './utils/imageCache';
+
+// Code-split heavy administration & modals for instant initial page loading and zero lag
+const Dashboard = lazy(() => import('./components/Dashboard').then(m => ({ default: m.Dashboard })));
+const GiftModal = lazy(() => import('./components/GiftModal').then(m => ({ default: m.GiftModal })));
+const PurchaseModal = lazy(() => import('./components/PurchaseModal').then(m => ({ default: m.PurchaseModal })));
+const DeliveryBoxModal = lazy(() => import('./components/DeliveryBoxModal').then(m => ({ default: m.DeliveryBoxModal })));
+const CartDrawer = lazy(() => import('./components/CartDrawer').then(m => ({ default: m.CartDrawer })));
+const AuthModal = lazy(() => import('./components/AuthModal').then(m => ({ default: m.AuthModal })));
+const SupportModal = lazy(() => import('./components/SupportModal').then(m => ({ default: m.SupportModal })));
+const VipModal = lazy(() => import('./components/VipModal').then(m => ({ default: m.VipModal })));
+const SiteSettingsModal = lazy(() => import('./components/SiteSettingsModal').then(m => ({ default: m.SiteSettingsModal })));
 
 export default function App() {
   // Language (Default to Arabic with instant RTL toggle)
@@ -47,6 +62,14 @@ export default function App() {
     } catch(e) {}
     return REAL_GIFTS_CATALOG.filter(g => !isDummyGift(g));
   });
+
+  // Pre-warm initial gifts posters into browser cache
+  useEffect(() => {
+    if (Array.isArray(gifts) && gifts.length > 0) {
+      const topUrls = gifts.slice(0, 6).map(g => g.posterUrl).filter(Boolean);
+      preloadImagesBatch(topUrls, 6);
+    }
+  }, [gifts]);
 
   useEffect(() => {
     // Purge any dummy test gifts immediately on app mount
@@ -96,20 +119,19 @@ export default function App() {
       }
     };
 
-    import('./lib/firebaseService').then(({ subscribeToEmployees, subscribeToUsers }) => {
-      const unsubEmployees = subscribeToEmployees((newEmployees) => {
-        currentEmployees = newEmployees;
-        updateCombined();
-      });
-      const unsubUsers = subscribeToUsers((newUsers) => {
-        currentUsers = newUsers;
-        updateCombined();
-      });
-      return () => {
-        unsubEmployees();
-        unsubUsers();
-      };
+    const unsubEmployees = subscribeToEmployees((newEmployees) => {
+      currentEmployees = newEmployees;
+      updateCombined();
     });
+    const unsubUsers = subscribeToUsers((newUsers) => {
+      currentUsers = newUsers;
+      updateCombined();
+    });
+
+    return () => {
+      unsubEmployees();
+      unsubUsers();
+    };
   }, []);
 
   // Hero Banners State
@@ -144,9 +166,16 @@ export default function App() {
     localStorage.setItem('jiawei_active_emp_id', activeEmployeeId);
   }, [activeEmployeeId]);
 
-  // Seed database once on mount if empty
+  // Seed database once per browser session in background without blocking
   useEffect(() => {
-    seedDatabase();
+    try {
+      if (!sessionStorage.getItem('jiawei_db_seeded')) {
+        sessionStorage.setItem('jiawei_db_seeded', '1');
+        seedDatabase().catch(() => {});
+      }
+    } catch {
+      seedDatabase().catch(() => {});
+    }
   }, []);
 
   // Cart State
@@ -164,6 +193,13 @@ export default function App() {
     }
     return null;
   });
+
+  // Pre-warm dashboard chunk if user is administrator
+  useEffect(() => {
+    if (user && ['admin', 'designer', 'employee'].includes(user.role)) {
+      import('./components/Dashboard').catch(() => {});
+    }
+  }, [user]);
 
   // Dynamic Categories & Site Settings State
   const [categories, setCategories] = useState<{ id: string; name: string; nameAr?: string; nameEn?: string }[]>([]);
@@ -186,18 +222,16 @@ export default function App() {
   const [isSiteSettingsOpen, setIsSiteSettingsOpen] = useState(false);
 
   useEffect(() => {
-    import('./lib/firebaseService').then(({ subscribeToCategories, subscribeToSiteSettings }) => {
-      const unsubCategories = subscribeToCategories((newCategories) => {
-        setCategories(newCategories);
-      });
-      const unsubSettings = subscribeToSiteSettings((settings) => {
-        if (settings) setSiteSettings(settings);
-      });
-      return () => {
-        unsubCategories();
-        unsubSettings();
-      };
+    const unsubCategories = subscribeToCategories((newCategories) => {
+      setCategories(newCategories);
     });
+    const unsubSettings = subscribeToSiteSettings((settings) => {
+      if (settings) setSiteSettings(settings);
+    });
+    return () => {
+      unsubCategories();
+      unsubSettings();
+    };
   }, []);
 
   useEffect(() => {
@@ -326,11 +360,11 @@ export default function App() {
     return list.slice(start, start + ITEMS_PER_PAGE);
   }, [filteredGifts, currentPage, ITEMS_PER_PAGE]);
 
-  const handleResetFilters = () => {
+  const handleResetFilters = useCallback(() => {
     setCategory('all');
     setSearchQuery('');
     setCurrentPage(1);
-  };
+  }, []);
 
   const generateWhatsAppLink = (gift: GiftItem, quantity: number = 1) => {
     const phone = siteSettings?.whatsapp || gift.author?.whatsapp || '+923400700013';
@@ -353,19 +387,19 @@ ID الحساب: ${user.id}` : ''}
     return `https://wa.me/${phone.replace(/[^0-9]/g, '')}?text=${encodedMessage}`;
   };
 
-  const handleAddToCart = (gift: GiftItem) => {
+  const handleAddToCart = useCallback((gift: GiftItem) => {
     window.open(generateWhatsAppLink(gift, 1), '_blank');
-  };
+  }, [siteSettings, user]);
 
-  const handleRemoveFromCart = (index: number) => {
+  const handleRemoveFromCart = useCallback((index: number) => {
     setCartItems((prev) => prev.filter((_, i) => i !== index));
-  };
+  }, []);
 
-  const handleInitiatePurchase = (gift: GiftItem) => {
+  const handleInitiatePurchase = useCallback((gift: GiftItem) => {
     window.open(generateWhatsAppLink(gift, 1), '_blank');
-  };
+  }, [siteSettings, user]);
 
-  const handleCheckoutAll = () => {
+  const handleCheckoutAll = useCallback(() => {
     if (cartItems.length === 0) return;
     const phone = siteSettings?.whatsapp || '+923400700013';
     let totalAll = 0;
@@ -385,9 +419,9 @@ ID الحساب: ${user.id}` : ''}
     window.open(`https://wa.me/${phone.replace(/[^0-9]/g, '')}?text=${encodedMessage}`, '_blank');
     setIsCartOpen(false);
     setCartItems([]);
-  };
+  }, [cartItems, siteSettings, user]);
 
-  const handleAuthSuccess = (authUser: AuthUser) => {
+  const handleAuthSuccess = useCallback((authUser: AuthUser) => {
     setUser(authUser);
     localStorage.setItem('jiawei_current_user_v1', JSON.stringify(authUser));
     setIsAuthOpen(false);
@@ -403,17 +437,15 @@ ID الحساب: ${user.id}` : ''}
       }
       setCurrentView('dashboard');
     }
-  };
+  }, [pendingPurchaseGift]);
 
-  const handleLogout = () => {
+  const handleLogout = useCallback(() => {
     setUser(null);
     localStorage.removeItem('jiawei_current_user_v1');
-    if (currentView === 'dashboard') {
-      setCurrentView('store');
-    }
-  };
+    setCurrentView('store');
+  }, []);
 
-  const handleStaffLogin = (emp: EmployeeUser) => {
+  const handleStaffLogin = useCallback((emp: EmployeeUser) => {
     const staffUser: AuthUser = {
       id: emp.id,
       name: emp.name,
@@ -435,23 +467,48 @@ ID الحساب: ${user.id}` : ''}
     setUser(staffUser);
     localStorage.setItem('jiawei_current_user_v1', JSON.stringify(staffUser));
     setActiveEmployeeId(emp.id);
-  };
+  }, []);
 
-  const handlePaymentSuccess = async (newDelivery: DeliveryItem) => {
+  const handlePaymentSuccess = useCallback(async (newDelivery: DeliveryItem) => {
     await addDelivery(newDelivery);
     setPurchaseGift(null);
     setSelectedGift(null);
     setActiveDelivery(newDelivery);
-  };
+  }, []);
 
-  const handleQuickCategorySelect = (key: string) => {
+  const handleQuickCategorySelect = useCallback((key: string) => {
     if (key === 'vip') setIsVipOpen(true);
     if (key === 'featured') {
       setCategory('all');
     } else {
       setCategory(key);
     }
-  };
+  }, []);
+
+  const handleSelectGift = useCallback((g: GiftItem) => {
+    setInspectedGift(g);
+    setSelectedGift(g);
+  }, []);
+
+  const handlePageChange = useCallback((page: number) => {
+    setCurrentPage(page);
+    const el = document.getElementById('gifts-gallery-section');
+    if (el) {
+      const y = el.getBoundingClientRect().top + window.pageYOffset - 85;
+      window.scrollTo({ top: Math.max(0, y), behavior: 'smooth' });
+    } else {
+      window.scrollTo({ top: 250, behavior: 'smooth' });
+    }
+  }, []);
+
+  // Smart background prefetching for the hovered / targeted pagination page
+  const handlePrefetchPage = useCallback((page: number) => {
+    if (!filteredGifts || filteredGifts.length === 0) return;
+    const start = (page - 1) * ITEMS_PER_PAGE;
+    const nextSlice = filteredGifts.slice(start, start + 6);
+    const urls = nextSlice.map(g => g.posterUrl).filter(Boolean);
+    preloadImagesBatch(urls, 6);
+  }, [filteredGifts, ITEMS_PER_PAGE]);
 
   return (
     <div className={`min-h-screen flex flex-col bg-[#07090e] text-slate-100 font-sans selection:bg-cyan-500 selection:text-black ${lang === 'ar' ? 'rtl font-[Cairo]' : 'ltr'}`}>
@@ -516,40 +573,30 @@ ID الحساب: ${user.id}` : ''}
               </div>
             ) : (
               <>
-                {/* Clean Responsive Cards Grid */}
+                {/* Clean Responsive Cards Grid with priority eager loading for first 4 cards */}
                 <div className="grid grid-cols-2 min-[480px]:grid-cols-2 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-4 2xl:grid-cols-5 gap-3 sm:gap-4 md:gap-5 mt-4">
-                  {paginatedGifts.map((gift) => (
+                  {paginatedGifts.map((gift, idx) => (
                     <GiftCard
                       key={gift.id}
                       gift={gift}
+                      priority={idx < 4}
                       lang={lang}
                       isSelected={inspectedGift?.id === gift.id}
-                      onSelectGift={(g) => {
-                        setInspectedGift(g);
-                        setSelectedGift(g);
-                      }}
-                      onQuickBuy={(g) => handleInitiatePurchase(g)}
-                      onAddToCart={(g) => handleAddToCart(g)}
+                      onSelectGift={handleSelectGift}
+                      onQuickBuy={handleInitiatePurchase}
+                      onAddToCart={handleAddToCart}
                     />
                   ))}
                 </div>
 
-                {/* Pagination Controls */}
+                {/* Pagination Controls with smart prefetching */}
                 <Pagination
                   currentPage={currentPage}
                   totalPages={totalPages}
                   totalItems={filteredGifts.length}
                   itemsPerPage={ITEMS_PER_PAGE}
-                  onPageChange={(page) => {
-                    setCurrentPage(page);
-                    const el = document.getElementById('gifts-gallery-section');
-                    if (el) {
-                      const y = el.getBoundingClientRect().top + window.pageYOffset - 85;
-                      window.scrollTo({ top: Math.max(0, y), behavior: 'smooth' });
-                    } else {
-                      window.scrollTo({ top: 250, behavior: 'smooth' });
-                    }
-                  }}
+                  onPageChange={handlePageChange}
+                  onPrefetchPage={handlePrefetchPage}
                   lang={lang}
                 />
               </>
@@ -597,26 +644,33 @@ ID الحساب: ${user.id}` : ''}
               </div>
             </div>
           ) : (
-            <Dashboard
-              lang={lang}
-              gifts={gifts}
-              setGifts={setGifts}
-              onPreviewGift={(g) => setSelectedGift(g)}
-              deliveries={deliveries}
-              setDeliveries={setDeliveries}
-              onOpenDeliveryBox={(d) => setActiveDelivery(d)}
-              employees={employees}
-              setEmployees={setEmployees}
-              activeEmployeeId={activeEmployeeId}
-              setActiveEmployeeId={setActiveEmployeeId}
-              onStaffLogin={handleStaffLogin}
-              banners={banners}
-              setBanners={setBanners}
-              currentUser={user}
-              categories={categories}
-              siteSettings={siteSettings}
-              onOpenSiteSettingsModal={() => setIsSiteSettingsOpen(true)}
-            />
+            <Suspense fallback={
+              <div className="min-h-[400px] flex flex-col items-center justify-center gap-3 text-slate-400">
+                <div className="w-10 h-10 border-2 border-cyan-400 border-t-transparent rounded-full animate-spin" />
+                <span className="text-xs font-mono">{lang === 'ar' ? 'جارٍ تحميل لوحة التحكم...' : 'Loading Dashboard...'}</span>
+              </div>
+            }>
+              <Dashboard
+                lang={lang}
+                gifts={gifts}
+                setGifts={setGifts}
+                onPreviewGift={(g) => setSelectedGift(g)}
+                deliveries={deliveries}
+                setDeliveries={setDeliveries}
+                onOpenDeliveryBox={(d) => setActiveDelivery(d)}
+                employees={employees}
+                setEmployees={setEmployees}
+                activeEmployeeId={activeEmployeeId}
+                setActiveEmployeeId={setActiveEmployeeId}
+                onStaffLogin={handleStaffLogin}
+                banners={banners}
+                setBanners={setBanners}
+                currentUser={user}
+                categories={categories}
+                siteSettings={siteSettings}
+                onOpenSiteSettingsModal={() => setIsSiteSettingsOpen(true)}
+              />
+            </Suspense>
           )}
         </main>
       )}
@@ -628,98 +682,117 @@ ID الحساب: ${user.id}` : ''}
         onOpenTool={() => setIsSupportOpen(true)}
       />
 
-      {/* MODAL 1: Gift Details & Animation Specs Modal */}
-      <GiftModal
-        gift={selectedGift}
-        onClose={() => setSelectedGift(null)}
-        lang={lang}
-        onAddToCart={(g) => handleAddToCart(g)}
-        onOpenPurchase={(g) => handleInitiatePurchase(g)}
-        allGifts={gifts}
-        onSelectGift={(g) => {
-          setInspectedGift(g);
-          setSelectedGift(g);
-        }}
-      />
+      {/* Lazy Modals with Suspense wrappers to keep main thread light */}
+      <Suspense fallback={null}>
+        {/* MODAL 1: Gift Details & Animation Specs Modal */}
+        {selectedGift && (
+          <GiftModal
+            gift={selectedGift}
+            onClose={() => setSelectedGift(null)}
+            lang={lang}
+            onAddToCart={(g) => handleAddToCart(g)}
+            onOpenPurchase={(g) => handleInitiatePurchase(g)}
+            allGifts={gifts}
+            onSelectGift={(g) => {
+              setInspectedGift(g);
+              setSelectedGift(g);
+            }}
+          />
+        )}
 
-      {/* MODAL 2: Purchase Box ("صندوق شراء") */}
-      <PurchaseModal
-        gift={purchaseGift}
-        onClose={() => setPurchaseGift(null)}
-        lang={lang}
-        onPaymentSuccess={handlePaymentSuccess}
-      />
+        {/* MODAL 2: Purchase Box ("صندوق شراء") */}
+        {purchaseGift && (
+          <PurchaseModal
+            gift={purchaseGift}
+            onClose={() => setPurchaseGift(null)}
+            lang={lang}
+            onPaymentSuccess={handlePaymentSuccess}
+          />
+        )}
 
-      {/* MODAL 3: Instant Delivery & Receiving Box ("صندوق استلام") */}
-      <DeliveryBoxModal
-        delivery={activeDelivery}
-        onClose={() => setActiveDelivery(null)}
-        lang={lang}
-        allDeliveries={deliveries}
-        onSelectDelivery={(del) => setActiveDelivery(del)}
-      />
+        {/* MODAL 3: Instant Delivery & Receiving Box ("صندوق استلام") */}
+        {activeDelivery && (
+          <DeliveryBoxModal
+            delivery={activeDelivery}
+            onClose={() => setActiveDelivery(null)}
+            lang={lang}
+            allDeliveries={deliveries}
+            onSelectDelivery={(del) => setActiveDelivery(del)}
+          />
+        )}
 
-      {/* MODAL 4: Cart Drawer */}
-      <CartDrawer
-        isOpen={isCartOpen}
-        onClose={() => setIsCartOpen(false)}
-        lang={lang}
-        cartItems={cartItems}
-        onRemoveItem={handleRemoveFromCart}
-        onCheckoutAll={handleCheckoutAll}
-      />
+        {/* MODAL 4: Cart Drawer */}
+        {isCartOpen && (
+          <CartDrawer
+            isOpen={isCartOpen}
+            onClose={() => setIsCartOpen(false)}
+            lang={lang}
+            cartItems={cartItems}
+            onRemoveItem={handleRemoveFromCart}
+            onCheckoutAll={handleCheckoutAll}
+          />
+        )}
 
-      {/* MODAL 5: Auth Modal */}
-      <AuthModal
-        isOpen={isAuthOpen}
-        onClose={() => {
-          setIsAuthOpen(false);
-          setPendingPurchaseGift(null);
-        }}
-        lang={lang}
-        employees={employees}
-        onAuthSuccess={handleAuthSuccess}
-        initialRole={authInitialRole}
-        pendingGift={pendingPurchaseGift}
-      />
+        {/* MODAL 5: Auth Modal */}
+        {isAuthOpen && (
+          <AuthModal
+            isOpen={isAuthOpen}
+            onClose={() => {
+              setIsAuthOpen(false);
+              setPendingPurchaseGift(null);
+            }}
+            lang={lang}
+            employees={employees}
+            onAuthSuccess={handleAuthSuccess}
+            initialRole={authInitialRole}
+            pendingGift={pendingPurchaseGift}
+          />
+        )}
 
-      {/* MODAL 6: Contact Us Modal (Exact match to reference video) */}
-      <SupportModal
-        isOpen={isSupportOpen}
-        onClose={() => setIsSupportOpen(false)}
-        lang={lang}
-        siteSettings={siteSettings}
-      />
+        {/* MODAL 6: Contact Us Modal */}
+        {isSupportOpen && (
+          <SupportModal
+            isOpen={isSupportOpen}
+            onClose={() => setIsSupportOpen(false)}
+            lang={lang}
+            siteSettings={siteSettings}
+          />
+        )}
 
-      {/* MODAL 7: VIP Club Upgrade */}
-      <VipModal
-        isOpen={isVipOpen}
-        onClose={() => setIsVipOpen(false)}
-        lang={lang}
-        onUpgrade={() => {
-          alert(lang === 'ar' ? 'مبروك! تم تفعيل عضوية VIP بنجاح.' : '恭喜！平台 VIP 黄金会员已成功激活。');
-        }}
-      />
+        {/* MODAL 7: VIP Club Upgrade */}
+        {isVipOpen && (
+          <VipModal
+            isOpen={isVipOpen}
+            onClose={() => setIsVipOpen(false)}
+            lang={lang}
+            onUpgrade={() => {
+              alert(lang === 'ar' ? 'مبروك! تم تفعيل عضوية VIP بنجاح.' : '恭喜！平台 VIP 黄金会员已成功激活。');
+            }}
+          />
+        )}
 
-      {/* MODAL 8: My Deliveries Box Shortcut Modal */}
-      {isDeliveriesOpen && (
-        <DeliveryBoxModal
-          delivery={deliveries[0] || null}
-          onClose={() => setIsDeliveriesOpen(false)}
-          lang={lang}
-          allDeliveries={deliveries}
-          onSelectDelivery={(del) => setActiveDelivery(del)}
-        />
-      )}
+        {/* MODAL 8: My Deliveries Box Shortcut Modal */}
+        {isDeliveriesOpen && (
+          <DeliveryBoxModal
+            delivery={deliveries[0] || null}
+            onClose={() => setIsDeliveriesOpen(false)}
+            lang={lang}
+            allDeliveries={deliveries}
+            onSelectDelivery={(del) => setActiveDelivery(del)}
+          />
+        )}
 
-      {/* MODAL 9: Site Identity & Contact Numbers Modal */}
-      <SiteSettingsModal
-        isOpen={isSiteSettingsOpen}
-        onClose={() => setIsSiteSettingsOpen(false)}
-        lang={lang}
-        siteSettings={siteSettings}
-        onSettingsSaved={(newSettings) => setSiteSettings(newSettings)}
-      />
+        {/* MODAL 9: Site Identity & Contact Numbers Modal */}
+        {isSiteSettingsOpen && (
+          <SiteSettingsModal
+            isOpen={isSiteSettingsOpen}
+            onClose={() => setIsSiteSettingsOpen(false)}
+            lang={lang}
+            siteSettings={siteSettings}
+            onSettingsSaved={(newSettings) => setSiteSettings(newSettings)}
+          />
+        )}
+      </Suspense>
     </div>
   );
 }

@@ -546,17 +546,16 @@ export const GiftModal: React.FC<GiftModalProps> = ({
                         <div className="aspect-square relative overflow-hidden bg-slate-950 flex items-center justify-center">
                           {rel.posterUrl ? (
                             <img
-                              src={rel.posterUrl}
+                              src={resolveMediaUrl(rel.posterUrl)}
                               alt={rel.title}
+                              loading="lazy"
+                              decoding="async"
                               className="w-full h-full object-cover group-hover:scale-105 transition-transform"
                             />
                           ) : (
-                            <video
-                              src={rel.videoUrl ? `${rel.videoUrl}#t=0.001` : undefined}
-                              muted
-                              playsInline
-                              className="w-full h-full object-cover"
-                            />
+                            <div className="w-full h-full flex items-center justify-center bg-slate-900 text-slate-500">
+                              <Film className="w-5 h-5 opacity-60" />
+                            </div>
                           )}
                         </div>
                         <div className="p-1 text-[9px] text-slate-300 truncate text-center font-medium">
