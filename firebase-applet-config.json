@@ -1,0 +1,12 @@
+{
+  "projectId": "svga-vip",
+  "appId": "1:850648356406:web:986246d3ab7f61724c2a97",
+  "apiKey": "AIzaSyDcF8JDy7djoMGpsRAkM-Nqjmq2KswqQgI",
+  "authDomain": "svga-vip.firebaseapp.com",
+  "firestoreDatabaseId": "(default)",
+  "storageBucket": "svga-vip.firebasestorage.app",
+  "messagingSenderId": "850648356406",
+  "measurementId": "",
+  "oAuthClientId": "",
+  "recaptchaSiteKey": ""
+}

@@ -1,0 +1,207 @@
+{
+  "entities": {
+    "Gift": {
+      "title": "Gift",
+      "description": "Live stream gift and VFX animation item",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 200 },
+        "titleAr": { "type": "string", "maxLength": 200 },
+        "titleEn": { "type": "string", "maxLength": 200 },
+        "price": { "type": "number" },
+        "vipPrice": { "type": "number" },
+        "exclusivePrice": { "type": "number" },
+        "videoUrl": { "type": "string" },
+        "posterUrl": { "type": "string" },
+        "category": { "type": "string", "maxLength": 100 },
+        "theme": { "type": "string", "maxLength": 100 },
+        "effectType": { "type": "string", "enum": ["2D", "3D"] },
+        "author": { "type": "object" },
+        "formats": { "type": "array" },
+        "tags": { "type": "array" },
+        "downloadsCount": { "type": "number" },
+        "favoritesCount": { "type": "number" },
+        "resolution": { "type": "string", "maxLength": 50 },
+        "fps": { "type": "number" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "title", "price", "videoUrl"]
+    },
+    "Delivery": {
+      "title": "Delivery",
+      "description": "Purchased order delivery item with license and cloud disk key",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "orderId": { "type": "string", "maxLength": 128 },
+        "giftId": { "type": "string", "maxLength": 128 },
+        "giftTitle": { "type": "string", "maxLength": 200 },
+        "licenseType": { "type": "string", "enum": ["standard", "exclusive"] },
+        "licenseKey": { "type": "string", "maxLength": 128 },
+        "downloadUrl": { "type": "string" },
+        "cloudDiskCode": { "type": "string", "maxLength": 50 },
+        "buyerName": { "type": "string", "maxLength": 150 },
+        "buyerContact": { "type": "string", "maxLength": 150 },
+        "purchaseDate": { "type": "string", "maxLength": 50 },
+        "price": { "type": "number" },
+        "status": { "type": "string", "enum": ["pending", "completed", "refunded"] }
+      },
+      "required": ["id", "orderId", "giftId", "price"]
+    },
+    "Employee": {
+      "title": "Employee",
+      "description": "Staff member or platform creator profile and access role",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 150 },
+        "email": { "type": "string", "maxLength": 200 },
+        "role": { "type": "string", "enum": ["admin", "designer", "employee", "user"] },
+        "whatsapp": { "type": "string", "maxLength": 50 },
+        "avatar": { "type": "string" },
+        "status": { "type": "string", "enum": ["active", "inactive"] },
+        "permissions": { "type": "object" },
+        "isProfileCompleted": { "type": "boolean" },
+        "giftsCount": { "type": "number" }
+      },
+      "required": ["id", "name", "role"]
+    },
+    "HeroBanner": {
+      "title": "HeroBanner",
+      "description": "Promotional banner in store header carousel",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 200 },
+        "titleAr": { "type": "string", "maxLength": 200 },
+        "subtitle": { "type": "string", "maxLength": 300 },
+        "badge": { "type": "string", "maxLength": 100 },
+        "imageUrl": { "type": "string" },
+        "btnText": { "type": "string", "maxLength": 100 },
+        "dimensionsNote": { "type": "string", "maxLength": 150 },
+        "isActive": { "type": "boolean" }
+      },
+      "required": ["id", "title", "imageUrl"]
+    },
+    "Category": {
+      "title": "Category",
+      "description": "Gift category taxonomy item",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 100 },
+        "nameAr": { "type": "string", "maxLength": 100 }
+      },
+      "required": ["id", "name"]
+    },
+    "Setting": {
+      "title": "Setting",
+      "description": "Site wide settings and presets configuration",
+      "type": "object",
+      "properties": {
+        "siteName": { "type": "string", "maxLength": 200 },
+        "siteSlogan": { "type": "string", "maxLength": 300 },
+        "siteSubTitle": { "type": "string", "maxLength": 300 },
+        "logoUrl": { "type": "string" },
+        "names": { "type": "array" },
+        "keepOriginalBackup": { "type": "boolean" },
+        "compressionMode": { "type": "string", "enum": ["lossless", "balanced", "max"] },
+        "updatedAt": { "type": "string" }
+      }
+    },
+    "MediaAsset": {
+      "title": "MediaAsset",
+      "description": "Optimized SVGA, MP4, and animation asset with SHA-256 deduplication and metrics",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 200 },
+        "hash": { "type": "string", "maxLength": 128 },
+        "type": { "type": "string", "enum": ["svga", "svga2", "mp4", "webp", "png", "jpeg", "gif", "audio"] },
+        "mimeType": { "type": "string", "maxLength": 100 },
+        "originalSize": { "type": "number" },
+        "optimizedSize": { "type": "number" },
+        "savedBytes": { "type": "number" },
+        "savingsPercent": { "type": "number" },
+        "resolution": { "type": "string", "maxLength": 50 },
+        "duration": { "type": "number" },
+        "fps": { "type": "number" },
+        "dataUrl": { "type": "string" },
+        "posterUrl": { "type": "string" },
+        "storagePath": { "type": "string", "maxLength": 300 },
+        "usageCount": { "type": "number" },
+        "usedInGiftIds": { "type": "array" },
+        "keepOriginalBackup": { "type": "boolean" },
+        "createdAt": { "type": "string" },
+        "lastUsed": { "type": "string" }
+      },
+      "required": ["id", "hash", "type", "originalSize", "optimizedSize"]
+    },
+    "ExternalVideo": {
+      "title": "ExternalVideo",
+      "description": "External cloud video upload record (Top4toP / Cloud Storage)",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "operationId": { "type": "string", "maxLength": 128 },
+        "fileName": { "type": "string", "maxLength": 255 },
+        "fileSize": { "type": "number" },
+        "fileType": { "type": "string", "maxLength": 100 },
+        "externalVideoUrl": { "type": "string" },
+        "downloadUrl": { "type": "string" },
+        "uploadStatus": { "type": "string", "enum": ["PENDING", "UPLOADING", "PROCESSING", "COMPLETED", "FAILED"] },
+        "uploadedAt": { "type": "string" },
+        "lastAttemptAt": { "type": "string" },
+        "errorMessage": { "type": "string" },
+        "sha256Hash": { "type": "string", "maxLength": 128 },
+        "provider": { "type": "string", "enum": ["top4top", "local", "cloud"] },
+        "giftId": { "type": "string", "maxLength": 128 },
+        "giftTitle": { "type": "string", "maxLength": 200 },
+        "verified": { "type": "boolean" },
+        "duration": { "type": "number" },
+        "resolution": { "type": "string", "maxLength": 50 },
+        "posterUrl": { "type": "string" }
+      },
+      "required": ["id", "fileName", "uploadStatus", "sha256Hash"]
+    }
+  },
+  "firestore": {
+    "/gifts/{giftId}": {
+      "schema": "Gift",
+      "description": "Store live stream gifts collection"
+    },
+    "/deliveries/{deliveryId}": {
+      "schema": "Delivery",
+      "description": "Order deliveries and licensing logs"
+    },
+    "/employees/{employeeId}": {
+      "schema": "Employee",
+      "description": "Staff and creator accounts"
+    },
+    "/users/{userId}": {
+      "schema": "Employee",
+      "description": "User accounts collection"
+    },
+    "/banners/{bannerId}": {
+      "schema": "HeroBanner",
+      "description": "Carousel hero banners"
+    },
+    "/categories/{categoryId}": {
+      "schema": "Category",
+      "description": "Gift categories"
+    },
+    "/settings/{settingId}": {
+      "schema": "Setting",
+      "description": "Platform settings and presets"
+    },
+    "/assets/{assetId}": {
+      "schema": "MediaAsset",
+      "description": "Optimized SVGA media asset library"
+    },
+    "/externalVideos/{videoId}": {
+      "schema": "ExternalVideo",
+      "description": "External video cloud storage and Top4toP uploads registry"
+    }
+  }
+}

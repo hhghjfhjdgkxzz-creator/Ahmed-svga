@@ -1,0 +1,2292 @@
+import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
+import { EditableLayer, SVGAProjectData, CanvasTool, GuideLine, FadeConfig, CropConfig, CropFeather } from './types';
+import { getLayerAnimatedTransform } from './motionEngine';
+import { applyTransparencyEffects } from './transparencyEngine';
+import { renderLayerShine } from './shineEngine';
+import { 
+  ZoomIn, ZoomOut, RefreshCw, Maximize2, 
+  Grid, Compass, Eye, Shield, RotateCcw,
+  Focus, ChevronUp, ChevronDown, ChevronLeft, ChevronRight,
+  Move, Crosshair, Scaling, Check, Lock, Unlock, X, Sliders, Pipette
+} from 'lucide-react';
+import { ChromaTargetColor, rgbToHex, identifyColorType } from './svgaSmartChromaEngine';
+
+interface SvgaDesignCanvasProps {
+  project: SVGAProjectData;
+  layers: EditableLayer[];
+  selectedLayerId: string | null;
+  selectedLayerIds?: string[];
+  currentFrame: number;
+  activeTool: CanvasTool;
+  zoom: number;
+  panOffset: { x: number; y: number };
+  showGrid: boolean;
+  showRulers: boolean;
+  showGuides: boolean;
+  bgColor: string;
+  onSelectLayer: (layerId: string | null, isMulti?: boolean) => void;
+  onUpdateLayerTransform: (layerId: string, transform: Partial<EditableLayer['transform']>) => void;
+  onBulkUpdateTransforms?: (updates: Array<{ id: string; transform: Partial<EditableLayer['transform']> }>) => void;
+  onZoomChange: (zoom: number) => void;
+  onPanChange: (offset: { x: number; y: number }) => void;
+  onDeleteLayer?: (layerId: string) => void;
+  onUpdateProjectDimensions?: (width: number, height: number, scaleLayers?: boolean) => void;
+  onChromaPickColor?: (color: ChromaTargetColor) => void;
+  onChromaHoverColor?: (color: ChromaTargetColor | null) => void;
+  fadeConfig?: FadeConfig;
+  cropConfig?: CropConfig;
+  cropFeather?: CropFeather;
+  bgImageUrl?: string | null;
+}
+
+type DragHandleType = 'move' | 'nw' | 'ne' | 'se' | 'sw' | 'n' | 's' | 'e' | 'w' | 'rot' | 'pan';
+
+interface Point {
+  x: number;
+  y: number;
+}
+
+// Matrix multiplication: M1 * M2
+// [a1 c1 tx1] * [a2 c2 tx2]
+// [b1 d1 ty1]   [b2 d2 ty2]
+function multiplyMatrices(
+  m1: [number, number, number, number, number, number],
+  m2: [number, number, number, number, number, number]
+): [number, number, number, number, number, number] {
+  const [a1, b1, c1, d1, tx1, ty1] = m1;
+  const [a2, b2, c2, d2, tx2, ty2] = m2;
+
+  return [
+    a1 * a2 + c1 * b2,
+    b1 * a2 + d1 * b2,
+    a1 * c2 + c1 * d2,
+    b1 * c2 + d1 * d2,
+    a1 * tx2 + c1 * ty2 + tx1,
+    b1 * tx2 + d1 * ty2 + ty1
+  ];
+}
+
+// Transform point with affine matrix [a, b, c, d, tx, ty]
+function transformPoint(m: [number, number, number, number, number, number], x: number, y: number): Point {
+  return {
+    x: m[0] * x + m[2] * y + m[4],
+    y: m[1] * x + m[3] * y + m[5]
+  };
+}
+
+// Helper to parse color channels safely (supports 0..1 floats and 0..255 ints)
+function parseColorChan(v: any): number {
+  const n = parseFloat(v) || 0;
+  return n > 1 ? Math.min(255, Math.max(0, Math.round(n))) : Math.min(255, Math.max(0, Math.round(n * 255)));
+}
+
+// Helper to map SVGA / AE blend modes to canvas globalCompositeOperation
+function mapBlendMode(raw: any): GlobalCompositeOperation | null {
+  if (!raw) return null;
+  const s = String(raw).toLowerCase().trim();
+  switch (s) {
+    case 'screen':
+    case '2':
+      return 'screen';
+    case 'add':
+    case 'lighter':
+    case 'plus':
+    case 'plus-lighter':
+    case 'linear-dodge':
+    case '16':
+      return 'lighter';
+    case 'multiply':
+    case '1':
+      return 'multiply';
+    case 'overlay':
+    case '3':
+      return 'overlay';
+    case 'darken':
+    case '4':
+      return 'darken';
+    case 'lighten':
+    case '5':
+      return 'lighten';
+    case 'color-dodge':
+    case '6':
+      return 'color-dodge';
+    case 'color-burn':
+    case '7':
+      return 'color-burn';
+    case 'hard-light':
+    case '8':
+      return 'hard-light';
+    case 'soft-light':
+    case '9':
+      return 'soft-light';
+    case 'difference':
+    case '10':
+      return 'difference';
+    case 'exclusion':
+    case '11':
+      return 'exclusion';
+    case 'hue':
+    case '12':
+      return 'hue';
+    case 'saturation':
+    case '13':
+      return 'saturation';
+    case 'color':
+    case '14':
+      return 'color';
+    case 'luminosity':
+    case '15':
+      return 'luminosity';
+    default:
+      return null;
+  }
+}
+
+// Robust SVG path parser matching SVGA 2.0 standards
+function applySvgPathToContext(ctx: CanvasRenderingContext2D, pathStr: string): boolean {
+  if (!pathStr || typeof pathStr !== 'string') return false;
+  const str = pathStr.trim();
+  if (!str) return false;
+
+  // 1. Try native Path2D first
+  try {
+    const p = new Path2D(str);
+    ctx.clip(p);
+    return true;
+  } catch (e) {
+    // Fallback to manual parser below
+  }
+
+  // 2. Parser fallback for concatenated/comma numbers in SVGA
+  try {
+    ctx.beginPath();
+    const segments = str
+      .replace(/([a-zA-Z])/g, '|||$1 ')
+      .replace(/,/g, ' ')
+      .split('|||');
+
+    let curX = 0;
+    let curY = 0;
+
+    for (const seg of segments) {
+      if (!seg) continue;
+      const trimmed = seg.trim();
+      if (!trimmed) continue;
+      const cmd = trimmed.charAt(0);
+      const args = trimmed.slice(1).trim().split(/\s+/).map(Number).filter(n => !isNaN(n));
+
+      switch (cmd) {
+        case 'M':
+          curX = args[0] || 0;
+          curY = args[1] || 0;
+          ctx.moveTo(curX, curY);
+          break;
+        case 'm':
+          curX += args[0] || 0;
+          curY += args[1] || 0;
+          ctx.moveTo(curX, curY);
+          break;
+        case 'L':
+          curX = args[0] || 0;
+          curY = args[1] || 0;
+          ctx.lineTo(curX, curY);
+          break;
+        case 'l':
+          curX += args[0] || 0;
+          curY += args[1] || 0;
+          ctx.lineTo(curX, curY);
+          break;
+        case 'H':
+          curX = args[0] || 0;
+          ctx.lineTo(curX, curY);
+          break;
+        case 'h':
+          curX += args[0] || 0;
+          ctx.lineTo(curX, curY);
+          break;
+        case 'V':
+          curY = args[0] || 0;
+          ctx.lineTo(curX, curY);
+          break;
+        case 'v':
+          curY += args[0] || 0;
+          ctx.lineTo(curX, curY);
+          break;
+        case 'C':
+          ctx.bezierCurveTo(args[0] || 0, args[1] || 0, args[2] || 0, args[3] || 0, args[4] || 0, args[5] || 0);
+          curX = args[4] || 0;
+          curY = args[5] || 0;
+          break;
+        case 'c':
+          ctx.bezierCurveTo(curX + (args[0] || 0), curY + (args[1] || 0), curX + (args[2] || 0), curY + (args[3] || 0), curX + (args[4] || 0), curY + (args[5] || 0));
+          curX += args[4] || 0;
+          curY += args[5] || 0;
+          break;
+        case 'S':
+          ctx.bezierCurveTo(curX, curY, args[0] || 0, args[1] || 0, args[2] || 0, args[3] || 0);
+          curX = args[2] || 0;
+          curY = args[3] || 0;
+          break;
+        case 's':
+          ctx.bezierCurveTo(curX, curY, curX + (args[0] || 0), curY + (args[1] || 0), curX + (args[2] || 0), curY + (args[3] || 0));
+          curX += args[2] || 0;
+          curY += args[3] || 0;
+          break;
+        case 'Q':
+          ctx.quadraticCurveTo(args[0] || 0, args[1] || 0, args[2] || 0, args[3] || 0);
+          curX = args[2] || 0;
+          curY = args[3] || 0;
+          break;
+        case 'q':
+          ctx.quadraticCurveTo(curX + (args[0] || 0), curY + (args[1] || 0), curX + (args[2] || 0), curY + (args[3] || 0));
+          curX += args[2] || 0;
+          curY += args[3] || 0;
+          break;
+        case 'Z':
+        case 'z':
+          ctx.closePath();
+          break;
+      }
+    }
+    ctx.clip();
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+// Trace path for drawing/filling shapes without clipping context
+function traceSvgPathToContext(ctx: CanvasRenderingContext2D, pathStr: string): boolean {
+  if (!pathStr || typeof pathStr !== 'string') return false;
+  const str = pathStr.trim();
+  if (!str) return false;
+
+  try {
+    ctx.beginPath();
+    const segments = str
+      .replace(/([a-zA-Z])/g, '|||$1 ')
+      .replace(/,/g, ' ')
+      .split('|||');
+
+    let curX = 0;
+    let curY = 0;
+
+    for (const seg of segments) {
+      if (!seg) continue;
+      const trimmed = seg.trim();
+      if (!trimmed) continue;
+      const cmd = trimmed.charAt(0);
+      const args = trimmed.slice(1).trim().split(/\s+/).map(Number).filter(n => !isNaN(n));
+
+      switch (cmd) {
+        case 'M':
+          curX = args[0] || 0;
+          curY = args[1] || 0;
+          ctx.moveTo(curX, curY);
+          break;
+        case 'm':
+          curX += args[0] || 0;
+          curY += args[1] || 0;
+          ctx.moveTo(curX, curY);
+          break;
+        case 'L':
+          curX = args[0] || 0;
+          curY = args[1] || 0;
+          ctx.lineTo(curX, curY);
+          break;
+        case 'l':
+          curX += args[0] || 0;
+          curY += args[1] || 0;
+          ctx.lineTo(curX, curY);
+          break;
+        case 'H':
+          curX = args[0] || 0;
+          ctx.lineTo(curX, curY);
+          break;
+        case 'h':
+          curX += args[0] || 0;
+          ctx.lineTo(curX, curY);
+          break;
+        case 'V':
+          curY = args[0] || 0;
+          ctx.lineTo(curX, curY);
+          break;
+        case 'v':
+          curY += args[0] || 0;
+          ctx.lineTo(curX, curY);
+          break;
+        case 'C':
+          ctx.bezierCurveTo(args[0] || 0, args[1] || 0, args[2] || 0, args[3] || 0, args[4] || 0, args[5] || 0);
+          curX = args[4] || 0;
+          curY = args[5] || 0;
+          break;
+        case 'c':
+          ctx.bezierCurveTo(curX + (args[0] || 0), curY + (args[1] || 0), curX + (args[2] || 0), curY + (args[3] || 0), curX + (args[4] || 0), curY + (args[5] || 0));
+          curX += args[4] || 0;
+          curY += args[5] || 0;
+          break;
+        case 'S':
+          ctx.quadraticCurveTo(args[0] || 0, args[1] || 0, args[2] || 0, args[3] || 0);
+          curX = args[2] || 0;
+          curY = args[3] || 0;
+          break;
+        case 's':
+          ctx.quadraticCurveTo(curX + (args[0] || 0), curY + (args[1] || 0), curX + (args[2] || 0), curY + (args[3] || 0));
+          curX += args[2] || 0;
+          curY += args[3] || 0;
+          break;
+        case 'Q':
+          ctx.quadraticCurveTo(args[0] || 0, args[1] || 0, args[2] || 0, args[3] || 0);
+          curX = args[2] || 0;
+          curY = args[3] || 0;
+          break;
+        case 'q':
+          ctx.quadraticCurveTo(curX + (args[0] || 0), curY + (args[1] || 0), curX + (args[2] || 0), curY + (args[3] || 0));
+          curX += args[2] || 0;
+          curY += args[3] || 0;
+          break;
+        case 'Z':
+        case 'z':
+          ctx.closePath();
+          break;
+      }
+    }
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+// Helper to render SVGA vector shapes if present
+function renderSvgaShapes(ctx: CanvasRenderingContext2D, shapes: any[]) {
+  if (!shapes || !Array.isArray(shapes)) return;
+
+  for (const shape of shapes) {
+    if (!shape) continue;
+    if (shape.type === 3 || shape.type === 'keep') continue;
+    ctx.save();
+
+    if (shape.transform) {
+      const { a = 1, b = 0, c = 0, d = 1, tx = 0, ty = 0 } = shape.transform;
+      ctx.transform(a, b, c, d, tx, ty);
+    }
+
+    const styles = shape.styles || {};
+    if (styles.fill) {
+      const { r = 0, g = 0, b = 0, a = 1 } = styles.fill;
+      const alpha = typeof a === 'number' ? Math.max(0, Math.min(1, a)) : 1;
+      ctx.fillStyle = `rgba(${parseColorChan(r)}, ${parseColorChan(g)}, ${parseColorChan(b)}, ${alpha})`;
+    }
+    if (styles.stroke) {
+      const { r = 0, g = 0, b = 0, a = 1 } = styles.stroke;
+      const alpha = typeof a === 'number' ? Math.max(0, Math.min(1, a)) : 1;
+      ctx.strokeStyle = `rgba(${parseColorChan(r)}, ${parseColorChan(g)}, ${parseColorChan(b)}, ${alpha})`;
+      ctx.lineWidth = styles.strokeWidth || 1;
+      if (styles.lineCap) ctx.lineCap = styles.lineCap.toLowerCase();
+      if (styles.lineJoin) ctx.lineJoin = styles.lineJoin.toLowerCase();
+      if (styles.miterLimit) ctx.miterLimit = styles.miterLimit;
+      if (styles.lineDash && Array.isArray(styles.lineDash)) {
+        try { ctx.setLineDash(styles.lineDash); } catch (e) {}
+      }
+    }
+
+    const pathD = shape.shape?.d || shape.args?.d || shape.pathArgs?.d;
+    if (pathD) {
+      let drawn = false;
+      try {
+        const p = new Path2D(pathD);
+        if (styles.fill) ctx.fill(p);
+        if (styles.stroke) ctx.stroke(p);
+        drawn = true;
+      } catch (e) {
+        drawn = false;
+      }
+      if (!drawn) {
+        traceSvgPathToContext(ctx, pathD);
+        if (styles.fill) ctx.fill();
+        if (styles.stroke) ctx.stroke();
+      }
+    } else if (shape.rect || (shape.type === 1 && shape.args)) {
+      const rObj = shape.rect || shape.args || {};
+      const { x = 0, y = 0, width = 0, height = 0, cornerRadius = 0, rx = 0 } = rObj;
+      const radius = cornerRadius || rx || 0;
+      if (radius > 0 && ctx.roundRect) {
+        ctx.beginPath();
+        ctx.roundRect(x, y, width, height, radius);
+        if (styles.fill) ctx.fill();
+        if (styles.stroke) ctx.stroke();
+      } else {
+        if (styles.fill) ctx.fillRect(x, y, width, height);
+        if (styles.stroke) ctx.strokeRect(x, y, width, height);
+      }
+    } else if (shape.ellipse || (shape.type === 2 && shape.args)) {
+      const eObj = shape.ellipse || shape.args || {};
+      const { x = 0, y = 0, radiusX = 0, radiusY = 0 } = eObj;
+      ctx.beginPath();
+      ctx.ellipse(x, y, Math.max(0.1, radiusX), Math.max(0.1, radiusY), 0, 0, Math.PI * 2);
+      if (styles.fill) ctx.fill();
+      if (styles.stroke) ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+}
+
+export const SvgaDesignCanvas: React.FC<SvgaDesignCanvasProps> = ({
+  project,
+  layers,
+  selectedLayerId,
+  selectedLayerIds = [],
+  currentFrame,
+  activeTool,
+  zoom,
+  panOffset,
+  showGrid,
+  showRulers,
+  showGuides,
+  bgColor,
+  onSelectLayer,
+  onUpdateLayerTransform,
+  onBulkUpdateTransforms,
+  onZoomChange,
+  onPanChange,
+  onDeleteLayer,
+  onUpdateProjectDimensions,
+  onChromaPickColor,
+  onChromaHoverColor,
+  fadeConfig,
+  cropConfig,
+  cropFeather,
+  bgImageUrl
+}) => {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const layersCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const patternCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const bgImageRef = useRef<HTMLImageElement | null>(null);
+  const imagesCache = useRef<Record<string, HTMLImageElement>>({});
+
+  // Smart Chroma Pen Magnifier Loupe State
+  const [chromaLoupe, setChromaLoupe] = useState<{
+    clientX: number;
+    clientY: number;
+    canvasX: number;
+    canvasY: number;
+    color: ChromaTargetColor;
+  } | null>(null);
+
+  // Project Dimensions Controls State
+  const [showDimensionsMenu, setShowDimensionsMenu] = useState<boolean>(false);
+  const [customWidthInput, setCustomWidthInput] = useState<number>(project.width || 500);
+  const [customHeightInput, setCustomHeightInput] = useState<number>(project.height || 500);
+  const [lockRatio, setLockRatio] = useState<boolean>(false);
+  const [scaleLayersWithResize, setScaleLayersWithResize] = useState<boolean>(false);
+
+  useEffect(() => {
+    setCustomWidthInput(project.width || 500);
+    setCustomHeightInput(project.height || 500);
+  }, [project.width, project.height]);
+
+  // Effective multi-selection IDs
+  const activeSelectedIds = useMemo(() => {
+    if (selectedLayerIds && selectedLayerIds.length > 0) {
+      return selectedLayerIds;
+    }
+    return selectedLayerId ? [selectedLayerId] : [];
+  }, [selectedLayerIds, selectedLayerId]);
+
+  // Active Drag / Interaction State
+  const [isInteracting, setIsInteracting] = useState(false);
+  const [dragHandle, setDragHandle] = useState<DragHandleType | null>(null);
+  const [dragStart, setDragStart] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [initialTransform, setInitialTransform] = useState<EditableLayer['transform'] | null>(null);
+  const [initialTransformsMap, setInitialTransformsMap] = useState<Record<string, EditableLayer['transform']>>({});
+  const [activeGuides, setActiveGuides] = useState<GuideLine[]>([]);
+  const [cacheVersion, setCacheVersion] = useState<number>(0);
+
+  const selectedLayer = useMemo(() => {
+    return layers.find(l => l.id === selectedLayerId) || null;
+  }, [layers, selectedLayerId]);
+
+  // Preload and sync images into cache with debounced canvas redraw to prevent freeze/OOM on 200+ images
+  useEffect(() => {
+    let redrawTimer: any = null;
+    const scheduleRedraw = () => {
+      if (redrawTimer) return;
+      redrawTimer = setTimeout(() => {
+        redrawTimer = null;
+        setCacheVersion(v => v + 1);
+      }, 30);
+    };
+
+    // Clean up any stale keys from previous projects
+    if (project.imagesMap) {
+      for (const k in imagesCache.current) {
+        if (!project.imagesMap[k]) {
+          delete imagesCache.current[k];
+        }
+      }
+    }
+
+    let hasLoadedAny = false;
+    for (const [key, dataUrl] of Object.entries(project.imagesMap || {})) {
+      const existing = imagesCache.current[key];
+      if (!existing || existing.src !== dataUrl) {
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.onload = () => {
+          scheduleRedraw();
+        };
+        img.src = dataUrl;
+        if (img.complete && img.naturalWidth > 0) {
+          scheduleRedraw();
+        }
+        imagesCache.current[key] = img;
+        hasLoadedAny = true;
+      }
+    }
+    if (hasLoadedAny) {
+      scheduleRedraw();
+    }
+
+    return () => {
+      if (redrawTimer) clearTimeout(redrawTimer);
+    };
+  }, [project.fileName, project.imagesMap]);
+
+  // Clean up image cache on unmount to release GPU and RAM memory
+  useEffect(() => {
+    return () => {
+      for (const k in imagesCache.current) {
+        const img = imagesCache.current[k];
+        if (img) {
+          img.onload = null;
+          img.onerror = null;
+          img.src = '';
+        }
+        delete imagesCache.current[k];
+      }
+    };
+  }, []);
+
+  // Preload and cache background image for preview
+  useEffect(() => {
+    if (!bgImageUrl) {
+      bgImageRef.current = null;
+      setCacheVersion(v => v + 1);
+      return;
+    }
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      bgImageRef.current = img;
+      setCacheVersion(v => v + 1);
+    };
+    img.onerror = () => {
+      console.warn("Could not load background image for preview:", bgImageUrl);
+    };
+    img.src = bgImageUrl;
+  }, [bgImageUrl]);
+
+  // Helper to convert screen client coords to Canvas design coordinates (viewBox)
+  const clientToCanvasCoords = useCallback((clientX: number, clientY: number) => {
+    if (!canvasRef.current) return { x: 0, y: 0 };
+    const rect = canvasRef.current.getBoundingClientRect();
+    const scale = zoom / 100;
+    const x = (clientX - rect.left) / scale;
+    const y = (clientY - rect.top) / scale;
+    return { x, y };
+  }, [zoom]);
+
+  // Compute Total Matrix for a Layer at current frame (incorporating keyframe animations)
+  const computeLayerMatrix = useCallback((layer: EditableLayer, frame: any) => {
+    const initialBounds = layer.initialBounds;
+    const animTransform = getLayerAnimatedTransform(layer, currentFrame);
+
+    const deltaX = animTransform.x - initialBounds.x;
+    const deltaY = animTransform.y - initialBounds.y;
+    const scaleX = animTransform.scaleX;
+    const scaleY = animTransform.scaleY;
+    const rotation = animTransform.rotation;
+
+    const pivotX = initialBounds.x + initialBounds.width / 2;
+    const pivotY = initialBounds.y + initialBounds.height / 2;
+
+    const rad = (rotation * Math.PI) / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+
+    // User affine matrix around pivot
+    const uA = scaleX * cos;
+    const uB = scaleX * sin;
+    const uC = -scaleY * sin;
+    const uD = scaleY * cos;
+    const uTx = (pivotX + deltaX) - (uA * pivotX + uC * pivotY);
+    const uTy = (pivotY + deltaY) - (uB * pivotX + uD * pivotY);
+
+    const mUser: [number, number, number, number, number, number] = [uA, uB, uC, uD, uTx, uTy];
+
+    // Frame native matrix
+    const fA = frame?.transform?.a ?? 1;
+    const fB = frame?.transform?.b ?? 0;
+    const fC = frame?.transform?.c ?? 0;
+    const fD = frame?.transform?.d ?? 1;
+    const fTx = frame?.transform?.tx ?? 0;
+    const fTy = frame?.transform?.ty ?? 0;
+    const mFrame: [number, number, number, number, number, number] = [fA, fB, fC, fD, fTx, fTy];
+
+    return multiplyMatrices(mUser, mFrame);
+  }, [currentFrame]);
+
+  // Helper to determine if a layer's frame is visible/active at given frameIndex
+  const getLayerFrameState = useCallback((layer: EditableLayer, frameIdx: number) => {
+    if (layer.isMerged || (layer.mergedLayers && layer.mergedLayers.length > 0)) {
+      return { isActive: true, frame: { alpha: 1, transform: { a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0 } }, alpha: 1.0 };
+    }
+
+    // Guaranteed visibility and state for video sequence layers
+    if (layer.isVideoSequence) {
+      const startF = layer.inFrame !== undefined ? layer.inFrame : (layer.keyframeSummary?.startFrame ?? 0);
+      const endF = layer.outFrame !== undefined ? layer.outFrame : (layer.keyframeSummary?.endFrame ?? (project.totalFrames - 1));
+      if (frameIdx < startF || frameIdx > endF) {
+        return { isActive: false, frame: null, alpha: 0 };
+      }
+      const frames = layer.spriteRef?.frames;
+      const frame = (frames && frames[frameIdx]) || (frames && frames[0]) || {
+        alpha: 1,
+        transform: { a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0 },
+        layout: { x: 0, y: 0, width: layer.transform?.width || project.width, height: layer.transform?.height || project.height }
+      };
+      return {
+        isActive: true,
+        frame: {
+          ...frame,
+          alpha: 1,
+          transform: frame.transform || { a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0 },
+          layout: frame.layout || { x: 0, y: 0, width: layer.transform?.width || project.width, height: layer.transform?.height || project.height }
+        },
+        alpha: 1.0
+      };
+    }
+
+    const frames = layer.spriteRef?.frames;
+    if (!frames || frames.length === 0) return { isActive: false, frame: null, alpha: 0 };
+
+    const isSingleFrameStatic = frames.length === 1 || layer.framesCount === 1;
+
+    // Check custom in/out duration span or keyframeSummary bounds
+    const startF = layer.inFrame !== undefined ? layer.inFrame : (layer.keyframeSummary?.startFrame ?? 0);
+    const endF = layer.outFrame !== undefined ? layer.outFrame : (layer.keyframeSummary?.endFrame ?? (project.totalFrames - 1));
+
+    // For non-static layers, check if outside duration span
+    if (!isSingleFrameStatic && (frameIdx < startF || frameIdx > endF)) {
+      return { isActive: false, frame: null, alpha: 0 };
+    }
+
+    // Support single-frame static layers and repeated/looping sequence layers
+    let frame = frames[frameIdx];
+    if (!frame && isSingleFrameStatic) {
+      frame = frames[0];
+    } else if (!frame && frames.length > 0 && frames.length < project.totalFrames) {
+      frame = frames[frameIdx % frames.length];
+    }
+
+    if (!frame) return { isActive: false, frame: null, alpha: 0 };
+
+    let isActive = false;
+    let frameAlpha = 0;
+
+    // Check if layer has any explicit alpha > 0
+    const hasAnyExplicitAlpha = Boolean(
+      (layer.spriteRef as any)?._hasExplicitAlpha ||
+      layer.keyframeSummary?.hasAnyExplicitAlpha ||
+      frames.some((fr: any) => fr && typeof fr.alpha === 'number' && fr.alpha > 0.005)
+    );
+
+    if (hasAnyExplicitAlpha) {
+      if (typeof frame.alpha === 'number') {
+        frameAlpha = frame.alpha;
+        isActive = frameAlpha > 0.005;
+      } else {
+        isActive = false;
+        frameAlpha = 0;
+      }
+    } else if (typeof frame.alpha === 'number') {
+      frameAlpha = frame.alpha;
+      isActive = frameAlpha > 0.005;
+    } else {
+      // In rare SVGA files where alpha was never written, check if frame has content
+      const hasImage = Boolean(layer.imageKey && (project.imagesMap[layer.imageKey] || layer.thumbnailUrl));
+      const hasShapes = Boolean(frame.shapes && Array.isArray(frame.shapes) && frame.shapes.length > 0);
+      const hasLayout = Boolean(frame.layout && (
+        (frame.layout.width !== undefined && frame.layout.width > 0) || 
+        (frame.layout.height !== undefined && frame.layout.height > 0)
+      ));
+      const hasTransform = Boolean(frame.transform);
+      const hasClip = Boolean(frame.clipPath);
+
+      if (hasImage || hasShapes || hasLayout || hasTransform || hasClip) {
+        isActive = true;
+        frameAlpha = 1.0;
+      } else {
+        isActive = false;
+        frameAlpha = 0;
+      }
+    }
+
+    return { isActive, frame, alpha: frameAlpha };
+  }, [project.totalFrames, project.imagesMap]);
+
+  // Zoom to Selected Element (Centers and focuses tightly on the selected element)
+  const handleZoomToSelection = useCallback(() => {
+    if (!selectedLayer || !containerRef.current) return;
+    const { isActive, frame } = getLayerFrameState(selectedLayer, currentFrame);
+    if (!isActive || !frame) return;
+
+    const totalMatrix = computeLayerMatrix(selectedLayer, frame);
+    const cachedImg = imagesCache.current[selectedLayer.imageKey];
+    const isMergedGroup = selectedLayer.isMerged || (selectedLayer.mergedLayers && selectedLayer.mergedLayers.length > 0);
+
+    let localX = 0;
+    let localY = 0;
+    let localW = cachedImg?.naturalWidth || selectedLayer.initialBounds.width || 50;
+    let localH = cachedImg?.naturalHeight || selectedLayer.initialBounds.height || 50;
+
+    if (isMergedGroup) {
+      localX = selectedLayer.initialBounds.x;
+      localY = selectedLayer.initialBounds.y;
+      localW = selectedLayer.initialBounds.width;
+      localH = selectedLayer.initialBounds.height;
+    } else if (frame.layout && frame.layout.width > 0 && frame.layout.height > 0) {
+      localX = frame.layout.x || 0;
+      localY = frame.layout.y || 0;
+      localW = frame.layout.width;
+      localH = frame.layout.height;
+    } else if (frame.layout) {
+      localX = frame.layout.x || 0;
+      localY = frame.layout.y || 0;
+    }
+
+    const p0 = transformPoint(totalMatrix, localX, localY);
+    const p2 = transformPoint(totalMatrix, localX + localW, localY + localH);
+    const centerLayerX = (p0.x + p2.x) / 2;
+    const centerLayerY = (p0.y + p2.y) / 2;
+    const layerW = Math.max(20, Math.abs(p2.x - p0.x));
+    const layerH = Math.max(20, Math.abs(p2.y - p0.y));
+
+    const cw = containerRef.current.clientWidth;
+    const ch = containerRef.current.clientHeight;
+
+    // Target zoom so the item is clearly visible (taking up around 200px - 350px on screen)
+    const targetZoom = Math.min(800, Math.max(150, Math.round(Math.min(cw / (layerW * 2.8), ch / (layerH * 2.8)) * 100)));
+    
+    // Canvas center
+    const canvasCenterX = project.width / 2;
+    const canvasCenterY = project.height / 2;
+    const scale = targetZoom / 100;
+    const panX = (canvasCenterX - centerLayerX) * scale;
+    const panY = (canvasCenterY - centerLayerY) * scale;
+
+    onZoomChange(targetZoom);
+    onPanChange({ x: Math.round(panX), y: Math.round(panY) });
+  }, [selectedLayer, currentFrame, getLayerFrameState, computeLayerMatrix, project, onZoomChange, onPanChange]);
+
+  // Directional Micro-Nudge Function
+  const handleMicroNudge = useCallback((dx: number, dy: number) => {
+    if (!selectedLayer) return;
+    const curX = selectedLayer.transform.x || 0;
+    const curY = selectedLayer.transform.y || 0;
+    onUpdateLayerTransform(selectedLayer.id, {
+      x: Number((curX + dx).toFixed(2)),
+      y: Number((curY + dy).toFixed(2))
+    });
+  }, [selectedLayer, onUpdateLayerTransform]);
+
+  // Global Keyboard Arrow Listener for Pixel-Perfect Movement
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (!selectedLayer) return;
+      const activeEl = document.activeElement;
+      if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || (activeEl as HTMLElement).isContentEditable)) {
+        return;
+      }
+
+      let step = 1;
+      if (e.shiftKey) step = 10;
+      else if (e.altKey || e.ctrlKey || e.metaKey) step = 0.1;
+
+      let dx = 0;
+      let dy = 0;
+
+      if (e.key === 'ArrowUp') { dy = -step; }
+      else if (e.key === 'ArrowDown') { dy = step; }
+      else if (e.key === 'ArrowLeft') { dx = -step; }
+      else if (e.key === 'ArrowRight') { dx = step; }
+      else { return; }
+
+      e.preventDefault();
+      handleMicroNudge(dx, dy);
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedLayer, handleMicroNudge]);
+
+  // Render loop
+  const drawScene = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const width = project.width;
+    const height = project.height;
+
+    if (canvas.width !== width) canvas.width = width;
+    if (canvas.height !== height) canvas.height = height;
+
+    ctx.clearRect(0, 0, width, height);
+
+    // 1. Draw Background:
+    // If a custom background image is uploaded, draw it firmly, uncropped, and fixed to fill the canvas
+    if (bgImageRef.current && bgImageRef.current.complete && bgImageRef.current.naturalWidth > 0) {
+      ctx.drawImage(bgImageRef.current, 0, 0, width, height);
+    } else if (bgColor === 'transparent') {
+      if (!patternCanvasRef.current) {
+        const pCanvas = document.createElement('canvas');
+        pCanvas.width = 32;
+        pCanvas.height = 32;
+        const pCtx = pCanvas.getContext('2d');
+        if (pCtx) {
+          pCtx.fillStyle = '#0f172a';
+          pCtx.fillRect(0, 0, 32, 32);
+          pCtx.fillStyle = '#1e293b';
+          pCtx.fillRect(0, 0, 16, 16);
+          pCtx.fillRect(16, 16, 16, 16);
+        }
+        patternCanvasRef.current = pCanvas;
+      }
+      const pattern = ctx.createPattern(patternCanvasRef.current, 'repeat');
+      if (pattern) {
+        ctx.fillStyle = pattern;
+        ctx.fillRect(0, 0, width, height);
+      } else {
+        ctx.fillStyle = '#0f172a';
+        ctx.fillRect(0, 0, width, height);
+      }
+    } else {
+      ctx.fillStyle = bgColor;
+      ctx.fillRect(0, 0, width, height);
+    }
+
+    // 2. Draw Pixel Grid if enabled
+    if (showGrid) {
+      ctx.save();
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
+      ctx.lineWidth = 1;
+      const gridSize = 40;
+      for (let x = 0; x <= width; x += gridSize) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, height);
+        ctx.stroke();
+      }
+      for (let y = 0; y <= height; y += gridSize) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(width, y);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    // 3. Prepare Layer Buffer Canvas to isolate gift layers from background
+    // (This guarantees that Edge Fade & Advanced Crop apply ONLY to the gift layers, leaving background pristine!)
+    if (!layersCanvasRef.current) {
+      layersCanvasRef.current = document.createElement('canvas');
+    }
+    const layersCanvas = layersCanvasRef.current;
+    if (layersCanvas.width !== width || layersCanvas.height !== height) {
+      layersCanvas.width = width;
+      layersCanvas.height = height;
+    }
+    const layersCtx = layersCanvas.getContext('2d');
+    if (!layersCtx) return;
+    layersCtx.clearRect(0, 0, width, height);
+
+    // 3. Leaf sprite drawing helper
+    const renderLeafSprite = (
+      targetCtx: CanvasRenderingContext2D,
+      layerItem: EditableLayer,
+      totalMatrix: [number, number, number, number, number, number],
+      alpha: number,
+      isMask: boolean = false
+    ) => {
+      const { isActive, frame, alpha: frameAlpha } = getLayerFrameState(layerItem, currentFrame);
+      if (!isActive || !frame || frameAlpha <= 0.005) return;
+
+      const fA = frame?.transform?.a ?? 1;
+      const fB = frame?.transform?.b ?? 0;
+      const fC = frame?.transform?.c ?? 0;
+      const fD = frame?.transform?.d ?? 1;
+      const fTx = frame?.transform?.tx ?? 0;
+      const fTy = frame?.transform?.ty ?? 0;
+      const mFrame: [number, number, number, number, number, number] = [fA, fB, fC, fD, fTx, fTy];
+
+      const finalTotalMatrix = multiplyMatrices(totalMatrix, mFrame);
+
+      targetCtx.save();
+      targetCtx.globalAlpha = Math.max(0, Math.min(1, alpha * frameAlpha));
+
+      // Support blendMode on frame or layer (only for regular sprites, not for masks)
+      if (!isMask) {
+        const rawBlend = frame.blendMode || layerItem.blendMode || layerItem.spriteRef?.blendMode;
+        const bm = mapBlendMode(rawBlend);
+        if (bm) {
+          targetCtx.globalCompositeOperation = bm;
+        }
+      }
+
+      targetCtx.transform(finalTotalMatrix[0], finalTotalMatrix[1], finalTotalMatrix[2], finalTotalMatrix[3], finalTotalMatrix[4], finalTotalMatrix[5]);
+
+      // Apply ClipPath if existing
+      if (frame.clipPath) {
+        applySvgPathToContext(targetCtx, frame.clipPath);
+      }
+
+      // Render Shapes if existing
+      if (frame.shapes && frame.shapes.length > 0) {
+        renderSvgaShapes(targetCtx, frame.shapes);
+      }
+
+      // Draw Image (standard SVGA 2.0: drawn with exact layout offset without distortion)
+      let activeImgKey = layerItem.imageKey;
+      if (layerItem.isVideoSequence || layerItem.sequencePrefix) {
+        const pfx = layerItem.sequencePrefix || 'frame_';
+        const candidateKeys = [
+          `${pfx}${currentFrame}.jpg`,
+          `${pfx}${currentFrame}.png`,
+          `${pfx}${currentFrame}.jpeg`,
+          `${pfx}${currentFrame}.webp`,
+          `${pfx}${currentFrame}`
+        ];
+        const matched = candidateKeys.find(k => (project.imagesMap && project.imagesMap[k]) || (imagesCache.current && imagesCache.current[k]));
+        activeImgKey = matched || `${pfx}${currentFrame}.jpg`;
+      }
+      let cachedImg = imagesCache.current[activeImgKey];
+      if (!cachedImg) {
+        let src = project.imagesMap[activeImgKey] || (activeImgKey === layerItem.imageKey ? layerItem.thumbnailUrl : undefined);
+        if (!src && project.imagesMap) {
+          const rawK = activeImgKey;
+          const cleanK = rawK.replace(/\.(png|jpe?g|webp|svg)$/i, '');
+          src = project.imagesMap[cleanK] || 
+                project.imagesMap[`${cleanK}.png`] || 
+                project.imagesMap[`${cleanK}.jpg`] || 
+                project.imagesMap[`${cleanK}.jpeg`] || 
+                project.imagesMap[rawK.toLowerCase()] || 
+                project.imagesMap[`img_${cleanK}`];
+          if (!src) {
+            const entry = Object.entries(project.imagesMap).find(([k]) => 
+              k.toLowerCase() === rawK.toLowerCase() ||
+              k.replace(/\.(png|jpe?g|webp|svg)$/i, '').toLowerCase() === cleanK.toLowerCase()
+            );
+            if (entry) src = entry[1];
+          }
+        }
+        if (src) {
+          const tempImg = new Image();
+          tempImg.onload = () => {
+            setCacheVersion(v => v + 1);
+          };
+          tempImg.src = src;
+          imagesCache.current[activeImgKey] = tempImg;
+          cachedImg = tempImg;
+        }
+      }
+
+      if (cachedImg && cachedImg.complete && cachedImg.naturalWidth > 0) {
+        let drawW = cachedImg.naturalWidth;
+        let drawH = cachedImg.naturalHeight;
+        
+        if (frame.layout) {
+          if (frame.layout.width && frame.layout.width > 0) {
+            drawW = frame.layout.width;
+          }
+          if (frame.layout.height && frame.layout.height > 0) {
+            drawH = frame.layout.height;
+          }
+        }
+        
+        targetCtx.drawImage(cachedImg, 0, 0, drawW, drawH);
+
+        if (layerItem.shineConfig && layerItem.shineConfig.enabled) {
+          renderLayerShine(targetCtx, drawW, drawH, currentFrame, project.totalFrames, layerItem.shineConfig);
+        }
+      }
+
+      targetCtx.restore();
+    };
+
+    // Helper to find a mask layer by matteKey (searches current group/scope and top-level layers)
+    const findMaskLayer = (matteKey: string, sourceLayer?: EditableLayer, scopeLayers?: EditableLayer[]): EditableLayer | undefined => {
+      const target = String(matteKey).trim();
+      const searchPool = scopeLayers && scopeLayers.length > 0 ? [...scopeLayers, ...layers] : layers;
+
+      const exact = searchPool.find(m => {
+        if (!m || m === sourceLayer) return false;
+        if (m.imageKey === target || m.id === target || m.name === target) return true;
+        if (m.spriteRef?.imageKey === target) return true;
+        const rawIdx = String(m.originalIndex);
+        if (rawIdx === target || `img_${rawIdx}` === target || `layer_${rawIdx}` === target) return true;
+        if (m.imageKey && (m.imageKey.endsWith(`_${target}`) || target.endsWith(`_${m.imageKey}`))) return true;
+        if (m.name && (m.name.endsWith(`_${target}`) || target.endsWith(`_${m.name}`))) return true;
+        return false;
+      });
+      if (exact) return exact;
+
+      if (sourceLayer && sourceLayer.groupId) {
+        return searchPool.find(m => {
+          if (!m || m === sourceLayer || m.groupId !== sourceLayer.groupId) return false;
+          if (m.imageKey?.includes(target) || target.includes(m.imageKey || '')) return true;
+          if (m.name?.includes(target) || target.includes(m.name || '')) return true;
+          return false;
+        });
+      }
+      return undefined;
+    };
+
+    // Recursive layer drawing function
+    const renderLayerRecursive = (
+      layerItem: EditableLayer,
+      parentMatrix: [number, number, number, number, number, number] | null,
+      parentAlpha: number,
+      siblingLayers?: EditableLayer[]
+    ) => {
+      if (!layerItem.visible) return;
+
+      const animTransform = getLayerAnimatedTransform(layerItem, currentFrame);
+      const layerAlpha = Math.max(0, Math.min(1, (animTransform.opacity !== undefined ? animTransform.opacity : layerItem.transform.opacity) / 100));
+      const currentAlpha = parentAlpha * layerAlpha;
+      if (currentAlpha <= 0.001) return;
+
+      // Calculate user transformation matrix for this layer relative to its initial bounds
+      const initialBounds = layerItem.initialBounds || { x: 0, y: 0, width: 100, height: 100 };
+      const deltaX = animTransform.x - initialBounds.x;
+      const deltaY = animTransform.y - initialBounds.y;
+      const scaleX = animTransform.scaleX;
+      const scaleY = animTransform.scaleY;
+      const rotation = animTransform.rotation;
+
+      const pivotX = initialBounds.x + initialBounds.width / 2;
+      const pivotY = initialBounds.y + initialBounds.height / 2;
+
+      const rad = (rotation * Math.PI) / 180;
+      const cos = Math.cos(rad);
+      const sin = Math.sin(rad);
+
+      const uA = scaleX * cos;
+      const uB = scaleX * sin;
+      const uC = -scaleY * sin;
+      const uD = scaleY * cos;
+      const uTx = (pivotX + deltaX) - (uA * pivotX + uC * pivotY);
+      const uTy = (pivotY + deltaY) - (uB * pivotX + uD * pivotY);
+      const mUser: [number, number, number, number, number, number] = [uA, uB, uC, uD, uTx, uTy];
+
+      const currentTotalMatrix = parentMatrix ? multiplyMatrices(parentMatrix, mUser) : mUser;
+
+      // If this layer has merged sublayers, recurse into sublayers!
+      // Render sublayers in visual stacking order (bottom to top, so sublayers[0] is in front)
+      if (layerItem.mergedLayers && layerItem.mergedLayers.length > 0) {
+        const sublayersToRender = [...layerItem.mergedLayers].reverse();
+        for (const sub of sublayersToRender) {
+          if (isLayerMatteTemplate(sub)) continue;
+          renderLayerRecursive(sub, currentTotalMatrix, currentAlpha, layerItem.mergedLayers);
+        }
+        return;
+      }
+
+      // Check if this layer has a matteKey mask
+      if (layerItem.matteKey) {
+        const maskLayer = findMaskLayer(layerItem.matteKey, layerItem, siblingLayers);
+        if (maskLayer) {
+          // If maskLayer is not active or transparent on this frame, the masked layer is 100% clipped
+          const maskState = getLayerFrameState(maskLayer, currentFrame);
+          if (!maskState.isActive || !maskState.frame || maskState.alpha <= 0.005) {
+            return;
+          }
+
+          if (!offscreenCanvasRef.current) {
+            offscreenCanvasRef.current = document.createElement('canvas');
+          }
+          const offCanvas = offscreenCanvasRef.current;
+          if (offCanvas.width !== width || offCanvas.height !== height) {
+            offCanvas.width = width;
+            offCanvas.height = height;
+          }
+          const offCtx = offCanvas.getContext('2d');
+          if (offCtx) {
+            offCtx.clearRect(0, 0, width, height);
+
+            // 1. Draw source layer (the effect / light streak / shine)
+            renderLeafSprite(offCtx, layerItem, currentTotalMatrix, currentAlpha);
+
+            // 2. Composite mask with destination-in
+            offCtx.save();
+            offCtx.globalCompositeOperation = 'destination-in';
+            const maskAnim = getLayerAnimatedTransform(maskLayer, currentFrame);
+            const maskAlpha = Math.max(0, Math.min(1, (maskAnim.opacity !== undefined ? maskAnim.opacity : maskLayer.transform.opacity) / 100));
+            const maskBounds = maskLayer.initialBounds || { x: 0, y: 0, width: 100, height: 100 };
+            const mDeltaX = maskAnim.x - maskBounds.x;
+            const mDeltaY = maskAnim.y - maskBounds.y;
+            const mPivotX = maskBounds.x + maskBounds.width / 2;
+            const mPivotY = maskBounds.y + maskBounds.height / 2;
+            const mRad = (maskAnim.rotation * Math.PI) / 180;
+            const mCos = Math.cos(mRad);
+            const mSin = Math.sin(mRad);
+            const muA = maskAnim.scaleX * mCos;
+            const muB = maskAnim.scaleX * mSin;
+            const muC = -maskAnim.scaleY * mSin;
+            const muD = maskAnim.scaleY * mCos;
+            const muTx = (mPivotX + mDeltaX) - (muA * mPivotX + muC * mPivotY);
+            const muTy = (mPivotY + mDeltaY) - (muB * mPivotX + muD * mPivotY);
+            const mMaskUser: [number, number, number, number, number, number] = [muA, muB, muC, muD, muTx, muTy];
+            const mMaskTotalMatrix = parentMatrix ? multiplyMatrices(parentMatrix, mMaskUser) : mMaskUser;
+            renderLeafSprite(offCtx, maskLayer, mMaskTotalMatrix, maskAlpha, true /* isMask */);
+            offCtx.restore();
+
+            // 3. Draw masked result to layers canvas, respecting layer blend mode
+            layersCtx.save();
+            const rawBlend = layerItem.blendMode || layerItem.spriteRef?.blendMode;
+            const bm = mapBlendMode(rawBlend);
+            if (bm) {
+              layersCtx.globalCompositeOperation = bm;
+            }
+            layersCtx.drawImage(offCanvas, 0, 0);
+            layersCtx.restore();
+            return;
+          }
+        }
+      }
+
+      // Standard leaf sprite drawing to layers canvas
+      renderLeafSprite(layersCtx, layerItem, currentTotalMatrix, currentAlpha);
+    };
+
+    // Identify all layers serving as matte/mask templates
+    const maskTemplateKeySet = new Set<string>();
+    for (const l of layers) {
+      if (l.matteKey) {
+        maskTemplateKeySet.add(String(l.matteKey).trim());
+      }
+      if (l.spriteRef?.matteKey) {
+        maskTemplateKeySet.add(String(l.spriteRef.matteKey).trim());
+      }
+    }
+
+    const isLayerMatteTemplate = (layer: EditableLayer): boolean => {
+      // If user selected this layer, always allow it to be rendered on canvas
+      if (layer.id === selectedLayer?.id || selectedLayerIds.includes(layer.id)) return false;
+      if (layer.isMatteMask) return true;
+      const rawIdx = String(layer.originalIndex);
+      if (
+        maskTemplateKeySet.has(layer.id) || 
+        maskTemplateKeySet.has(rawIdx) || 
+        maskTemplateKeySet.has(`layer_${rawIdx}`) ||
+        (layer.imageKey && maskTemplateKeySet.has(layer.imageKey)) ||
+        (layer.name && maskTemplateKeySet.has(layer.name)) ||
+        (layer.spriteRef?.imageKey && maskTemplateKeySet.has(layer.spriteRef.imageKey))
+      ) {
+        return true;
+      }
+      return false;
+    };
+
+    // Render all visible top-level layers in visual stacking order into layersCtx:
+    // layers[last] (background) is drawn first -> layers[0] (foreground/top of stack) is drawn last (in front)!
+    const layersToRender = [...layers].reverse();
+    for (const layer of layersToRender) {
+      // A matte mask template must NEVER be drawn as a standalone opaque layer on the canvas!
+      if (isLayerMatteTemplate(layer)) {
+        continue;
+      }
+      renderLayerRecursive(layer, null, 1.0);
+    }
+
+    // 3.5 Apply Edge Fade & Advanced Edge Crop to the GIFT LAYERS ONLY on layersCtx!
+    // (Notice: The uploaded background image on ctx is untouched, so it remains full, crisp, and fixed!)
+    if (fadeConfig && cropConfig && cropFeather) {
+      applyTransparencyEffects(layersCtx, width, height, fadeConfig, cropConfig, cropFeather);
+    }
+
+    // 3.6 Draw the rendered & faded gift layers directly on top of the pristine background!
+    ctx.drawImage(layersCanvas, 0, 0);
+
+    // 4. Draw Active Smart Alignment Guides
+    if (showGuides && activeGuides.length > 0) {
+      ctx.save();
+      ctx.strokeStyle = '#06b6d4';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 4]);
+
+      for (const guide of activeGuides) {
+        ctx.beginPath();
+        if (guide.type === 'vertical') {
+          ctx.moveTo(guide.position, 0);
+          ctx.lineTo(guide.position, height);
+        } else {
+          ctx.moveTo(0, guide.position);
+          ctx.lineTo(width, guide.position);
+        }
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    // 5. Draw Selection Transform Box and Handles for Selected Layers
+    const layersToHighlight = layers.filter(l => activeSelectedIds.includes(l.id) && l.visible && !l.locked);
+
+    for (const targetL of layersToHighlight) {
+      const isPrimary = targetL.id === selectedLayerId;
+      const { isActive, frame } = getLayerFrameState(targetL, currentFrame);
+
+      if (isActive && frame) {
+        ctx.save();
+        const totalMatrix = computeLayerMatrix(targetL, frame);
+        const isMergedGroup = targetL.isMerged || (targetL.mergedLayers && targetL.mergedLayers.length > 0);
+        const cachedImg = imagesCache.current[targetL.imageKey];
+
+        let localX = 0;
+        let localY = 0;
+        let localW = cachedImg?.naturalWidth || targetL.initialBounds.width || 100;
+        let localH = cachedImg?.naturalHeight || targetL.initialBounds.height || 100;
+
+        if (isMergedGroup) {
+          localX = targetL.initialBounds.x;
+          localY = targetL.initialBounds.y;
+          localW = targetL.initialBounds.width;
+          localH = targetL.initialBounds.height;
+        } else {
+          localX = frame.layout?.x ?? 0;
+          localY = frame.layout?.y ?? 0;
+          if (frame.layout && frame.layout.width > 0) {
+            localW = frame.layout.width;
+          }
+          if (frame.layout && frame.layout.height > 0) {
+            localH = frame.layout.height;
+          }
+        }
+
+        // Transform 4 corners into canvas coordinates
+        const p0 = transformPoint(totalMatrix, localX, localY); // top-left
+        const p1 = transformPoint(totalMatrix, localX + localW, localY); // top-right
+        const p2 = transformPoint(totalMatrix, localX + localW, localY + localH); // bottom-right
+        const p3 = transformPoint(totalMatrix, localX, localY + localH); // bottom-left
+
+        // Midpoints
+        const midTop = { x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2 };
+        const midRight = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
+        const midBottom = { x: (p2.x + p3.x) / 2, y: (p2.y + p3.y) / 2 };
+        const midLeft = { x: (p3.x + p0.x) / 2, y: (p3.y + p0.y) / 2 };
+        const center = { x: (p0.x + p2.x) / 2, y: (p0.y + p2.y) / 2 };
+
+        // Rotation Handle position (extended from midTop)
+        const topVectorX = p1.x - p0.x;
+        const topVectorY = p1.y - p0.y;
+        const topLen = Math.hypot(topVectorX, topVectorY) || 1;
+        const leftVectorX = p3.x - p0.x;
+        const leftVectorY = p3.y - p0.y;
+        const leftLen = Math.hypot(leftVectorX, leftVectorY) || 1;
+
+        // Determine if element is visually small in design units
+        const isSmallElement = topLen < 55 || leftLen < 55;
+        const isTinyElement = topLen < 32 || leftLen < 32;
+
+        const normalX = -topVectorY / topLen;
+        const normalY = topVectorX / topLen;
+        const rotOffset = isTinyElement ? 36 : isSmallElement ? 32 : 28;
+        const rotHandle = { x: midTop.x + normalX * rotOffset, y: midTop.y + normalY * rotOffset };
+
+        // Draw Bounding Polygon for layer
+        ctx.beginPath();
+        ctx.moveTo(p0.x, p0.y);
+        ctx.lineTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
+        ctx.lineTo(p3.x, p3.y);
+        ctx.closePath();
+
+        ctx.strokeStyle = isPrimary ? '#6366f1' : '#f59e0b'; // Indigo for primary, Amber for co-selected
+        ctx.lineWidth = isPrimary ? 2 : 1.5;
+        ctx.stroke();
+
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 4]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Render Transform Handles (for primary layer, or when only 1 is selected)
+        if (isPrimary || activeSelectedIds.length === 1) {
+          // Rotation stem
+          ctx.beginPath();
+          ctx.moveTo(midTop.x, midTop.y);
+          ctx.lineTo(rotHandle.x, rotHandle.y);
+          ctx.strokeStyle = isPrimary ? '#6366f1' : '#f59e0b';
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+
+          // Rotation Handle circle
+          ctx.beginPath();
+          ctx.arc(rotHandle.x, rotHandle.y, isTinyElement ? 5 : 6, 0, Math.PI * 2);
+          ctx.fillStyle = isPrimary ? '#a855f7' : '#f59e0b'; // Purple or Amber rotation knob
+          ctx.fill();
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+
+          const handlesToDraw = isTinyElement
+            ? [p0, p1, p2, p3]
+            : [p0, midTop, p1, midRight, p2, midBottom, p3, midLeft];
+
+          const handleRadius = isTinyElement ? 3.5 : isSmallElement ? 4.5 : 5.5;
+
+          handlesToDraw.forEach(h => {
+            ctx.beginPath();
+            ctx.arc(h.x, h.y, handleRadius, 0, Math.PI * 2);
+            ctx.fillStyle = '#ffffff';
+            ctx.fill();
+            ctx.strokeStyle = isPrimary ? '#6366f1' : '#f59e0b';
+            ctx.lineWidth = 1.8;
+            ctx.stroke();
+          });
+        }
+
+        ctx.restore();
+      }
+    }
+  }, [project, layers, selectedLayer, activeSelectedIds, selectedLayerId, currentFrame, bgColor, showGrid, showGuides, activeGuides, computeLayerMatrix, getLayerFrameState, cacheVersion, fadeConfig, cropConfig, cropFeather]);
+
+  useEffect(() => {
+    drawScene();
+  }, [drawScene]);
+
+  // Hit test to find layer under cursor (search foreground to background: layers[0] to layers[last])
+  // Locked layers are completely skipped so they cannot be clicked/selected on canvas
+  const hitTestLayer = useCallback((cx: number, cy: number): string | null => {
+    for (let i = 0; i < layers.length; i++) {
+      const layer = layers[i];
+      if (!layer.visible || layer.locked || layer.isMatteMask) continue;
+
+      const { isActive, frame } = getLayerFrameState(layer, currentFrame);
+      if (!isActive || !frame) continue;
+
+      const totalMatrix = computeLayerMatrix(layer, frame);
+      const isMergedGroup = layer.isMerged || (layer.mergedLayers && layer.mergedLayers.length > 0);
+      const cachedImg = imagesCache.current[layer.imageKey];
+
+      let localX = 0;
+      let localY = 0;
+      let localW = cachedImg?.naturalWidth || layer.initialBounds.width || 100;
+      let localH = cachedImg?.naturalHeight || layer.initialBounds.height || 100;
+
+      if (isMergedGroup) {
+        localX = layer.initialBounds.x;
+        localY = layer.initialBounds.y;
+        localW = layer.initialBounds.width;
+        localH = layer.initialBounds.height;
+      } else {
+        localX = frame.layout?.x ?? 0;
+        localY = frame.layout?.y ?? 0;
+        if (frame.layout && frame.layout.width > 0) {
+          localW = frame.layout.width;
+        }
+        if (frame.layout && frame.layout.height > 0) {
+          localH = frame.layout.height;
+        }
+      }
+
+      // Invert matrix to test point in local coords
+      const [a, b, c, d, tx, ty] = totalMatrix;
+      const det = a * d - b * c;
+      if (Math.abs(det) < 0.0001) continue;
+
+      const invA = d / det;
+      const invB = -b / det;
+      const invC = -c / det;
+      const invD = a / det;
+      const invTx = (c * ty - d * tx) / det;
+      const invTy = (b * tx - a * ty) / det;
+
+      const localPointX = invA * cx + invC * cy + invTx;
+      const localPointY = invB * cx + invD * cy + invTy;
+
+      // Generous hit tolerance for small layers so clicking near them easily grabs them
+      const hitMargin = (localW < 40 || localH < 40) ? 14 : 8;
+
+      if (
+        localPointX >= localX - hitMargin &&
+        localPointX <= localX + localW + hitMargin &&
+        localPointY >= localY - hitMargin &&
+        localPointY <= localY + localH + hitMargin
+      ) {
+        return layer.id;
+      }
+    }
+    return null;
+  }, [layers, currentFrame, computeLayerMatrix, getLayerFrameState]);
+
+  // Determine handle under mouse for selected layer
+  const getHandleUnderMouse = useCallback((cx: number, cy: number): DragHandleType | null => {
+    if (!selectedLayer || selectedLayer.locked) return null;
+    const { isActive, frame } = getLayerFrameState(selectedLayer, currentFrame);
+    if (!isActive || !frame) return null;
+
+    const totalMatrix = computeLayerMatrix(selectedLayer, frame);
+    const isMergedGroup = selectedLayer.isMerged || (selectedLayer.mergedLayers && selectedLayer.mergedLayers.length > 0);
+    const cachedImg = imagesCache.current[selectedLayer.imageKey];
+
+    let localX = 0;
+    let localY = 0;
+    let localW = cachedImg?.naturalWidth || selectedLayer.initialBounds.width || 100;
+    let localH = cachedImg?.naturalHeight || selectedLayer.initialBounds.height || 100;
+
+    if (isMergedGroup) {
+      localX = selectedLayer.initialBounds.x;
+      localY = selectedLayer.initialBounds.y;
+      localW = selectedLayer.initialBounds.width;
+      localH = selectedLayer.initialBounds.height;
+    } else if (frame.layout && frame.layout.width > 0 && frame.layout.height > 0) {
+      localX = frame.layout.x || 0;
+      localY = frame.layout.y || 0;
+      localW = frame.layout.width;
+      localH = frame.layout.height;
+    } else if (frame.layout) {
+      localX = frame.layout.x || 0;
+      localY = frame.layout.y || 0;
+    }
+
+    const p0 = transformPoint(totalMatrix, localX, localY);
+    const p1 = transformPoint(totalMatrix, localX + localW, localY);
+    const p2 = transformPoint(totalMatrix, localX + localW, localY + localH);
+    const p3 = transformPoint(totalMatrix, localX, localY + localH);
+
+    const midTop = { x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2 };
+    const midRight = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
+    const midBottom = { x: (p2.x + p3.x) / 2, y: (p2.y + p3.y) / 2 };
+    const midLeft = { x: (p3.x + p0.x) / 2, y: (p3.y + p0.y) / 2 };
+
+    const topVectorX = p1.x - p0.x;
+    const topVectorY = p1.y - p0.y;
+    const topLen = Math.hypot(topVectorX, topVectorY) || 1;
+    const leftVectorX = p3.x - p0.x;
+    const leftVectorY = p3.y - p0.y;
+    const leftLen = Math.hypot(leftVectorX, leftVectorY) || 1;
+
+    const isSmallElement = topLen < 55 || leftLen < 55;
+    const isTinyElement = topLen < 32 || leftLen < 32;
+
+    const normalX = -topVectorY / topLen;
+    const normalY = topVectorX / topLen;
+    const rotOffset = isTinyElement ? 36 : isSmallElement ? 32 : 28;
+    const rotHandle = { x: midTop.x + normalX * rotOffset, y: midTop.y + normalY * rotOffset };
+
+    // 1. Rotation knob test (tested first, outside the box)
+    if (Math.hypot(cx - rotHandle.x, cy - rotHandle.y) <= (isTinyElement ? 10 : 12)) return 'rot';
+
+    // 2. Midpoint edge handles test (n, s, e, w) - generous hit distance so 4-way stretching is effortless
+    if (!isTinyElement) {
+      const midHitDist = isSmallElement ? 10 : 13;
+      if (Math.hypot(cx - midTop.x, cy - midTop.y) <= midHitDist) return 'n';
+      if (Math.hypot(cx - midRight.x, cy - midRight.y) <= midHitDist) return 'e';
+      if (Math.hypot(cx - midBottom.x, cy - midBottom.y) <= midHitDist) return 's';
+      if (Math.hypot(cx - midLeft.x, cy - midLeft.y) <= midHitDist) return 'w';
+    }
+
+    // 3. Corner resize handles test
+    const cornerHitDist = isTinyElement ? 7 : isSmallElement ? 9 : 12;
+    if (Math.hypot(cx - p0.x, cy - p0.y) <= cornerHitDist) return 'nw';
+    if (Math.hypot(cx - p1.x, cy - p1.y) <= cornerHitDist) return 'ne';
+    if (Math.hypot(cx - p2.x, cy - p2.y) <= cornerHitDist) return 'se';
+    if (Math.hypot(cx - p3.x, cy - p3.y) <= cornerHitDist) return 'sw';
+
+    // 4. Check inside polygon (or generous perimeter) for move
+    const clickedLayerId = hitTestLayer(cx, cy);
+    if (clickedLayerId === selectedLayer.id) return 'move';
+
+    return null;
+  }, [selectedLayer, currentFrame, computeLayerMatrix, hitTestLayer]);
+
+  // Dynamic Hover Cursor
+  const [canvasCursor, setCanvasCursor] = useState<string>('default');
+
+  // Mouse Down Event Handler
+  const handleMouseDown = (e: React.MouseEvent) => {
+    if (activeTool === 'chroma-pen') {
+      if (canvasRef.current && onChromaPickColor) {
+        const rect = canvasRef.current.getBoundingClientRect();
+        const scaleX = project.width / rect.width;
+        const scaleY = project.height / rect.height;
+        const cx = Math.round((e.clientX - rect.left) * scaleX);
+        const cy = Math.round((e.clientY - rect.top) * scaleY);
+        if (cx >= 0 && cx < project.width && cy >= 0 && cy < project.height) {
+          const ctx = canvasRef.current.getContext('2d');
+          if (ctx) {
+            const p = ctx.getImageData(cx, cy, 1, 1).data;
+            const color: ChromaTargetColor = {
+              r: p[0],
+              g: p[1],
+              b: p[2],
+              hex: rgbToHex(p[0], p[1], p[2])
+            };
+            onChromaPickColor(color);
+          }
+        }
+      }
+      return;
+    }
+
+    if (e.button === 1 || activeTool === 'hand') {
+      setIsInteracting(true);
+      setDragHandle('pan');
+      setDragStart({ x: e.clientX, y: e.clientY });
+      return;
+    }
+
+    if (e.button !== 0) return;
+
+    const isModifierKey = e.ctrlKey || e.metaKey || e.shiftKey;
+    const coords = clientToCanvasCoords(e.clientX, e.clientY);
+    const handle = getHandleUnderMouse(coords.x, coords.y);
+
+    if (handle) {
+      setIsInteracting(true);
+      setDragHandle(handle);
+      setDragStart(coords);
+
+      // Snapshot all selected layers transforms for simultaneous collective delta manipulation
+      const initialMap: Record<string, EditableLayer['transform']> = {};
+      layers.forEach(l => {
+        if (activeSelectedIds.includes(l.id)) {
+          initialMap[l.id] = { ...l.transform };
+        }
+      });
+      setInitialTransformsMap(initialMap);
+
+      if (selectedLayer) {
+        setInitialTransform({ ...selectedLayer.transform });
+      }
+    } else {
+      const clickedId = hitTestLayer(coords.x, coords.y);
+      if (clickedId) {
+        if (isModifierKey) {
+          onSelectLayer(clickedId, true);
+        } else {
+          // If clicking an unselected layer without Ctrl/Shift, select it
+          // If clicking one of the already selected multiple layers, keep selection to drag together
+          if (!activeSelectedIds.includes(clickedId)) {
+            onSelectLayer(clickedId, false);
+          }
+        }
+
+        const effectiveIds = activeSelectedIds.includes(clickedId) ? activeSelectedIds : [clickedId];
+        const initialMap: Record<string, EditableLayer['transform']> = {};
+        layers.forEach(l => {
+          if (effectiveIds.includes(l.id)) {
+            initialMap[l.id] = { ...l.transform };
+          }
+        });
+        setInitialTransformsMap(initialMap);
+
+        const targetLayer = layers.find(l => l.id === clickedId);
+        if (targetLayer) {
+          setIsInteracting(true);
+          setDragHandle('move');
+          setDragStart(coords);
+          setInitialTransform({ ...targetLayer.transform });
+        }
+      } else {
+        if (!isModifierKey) {
+          onSelectLayer(null, false);
+        }
+      }
+    }
+  };
+
+  // Mouse Move Event Handler
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (!isInteracting) {
+      if (activeTool === 'chroma-pen') {
+        setCanvasCursor('crosshair');
+        if (canvasRef.current) {
+          const rect = canvasRef.current.getBoundingClientRect();
+          const scaleX = project.width / rect.width;
+          const scaleY = project.height / rect.height;
+          const cx = Math.round((e.clientX - rect.left) * scaleX);
+          const cy = Math.round((e.clientY - rect.top) * scaleY);
+          if (cx >= 0 && cx < project.width && cy >= 0 && cy < project.height) {
+            const ctx = canvasRef.current.getContext('2d');
+            if (ctx) {
+              const p = ctx.getImageData(cx, cy, 1, 1).data;
+              const color: ChromaTargetColor = {
+                r: p[0],
+                g: p[1],
+                b: p[2],
+                hex: rgbToHex(p[0], p[1], p[2])
+              };
+              setChromaLoupe({
+                clientX: e.clientX,
+                clientY: e.clientY,
+                canvasX: cx,
+                canvasY: cy,
+                color
+              });
+              onChromaHoverColor?.(color);
+            }
+          } else {
+            setChromaLoupe(null);
+            onChromaHoverColor?.(null);
+          }
+        }
+        return;
+      }
+
+      if (activeTool === 'hand') {
+        setCanvasCursor('grab');
+        return;
+      }
+      const coords = clientToCanvasCoords(e.clientX, e.clientY);
+      const handle = getHandleUnderMouse(coords.x, coords.y);
+
+      if (handle) {
+        if (handle === 'rot') setCanvasCursor('crosshair');
+        else if (handle === 'nw' || handle === 'se') setCanvasCursor('nwse-resize');
+        else if (handle === 'ne' || handle === 'sw') setCanvasCursor('nesw-resize');
+        else if (handle === 'n' || handle === 's') setCanvasCursor('ns-resize');
+        else if (handle === 'e' || handle === 'w') setCanvasCursor('ew-resize');
+        else if (handle === 'move') setCanvasCursor('move');
+        else setCanvasCursor('default');
+      } else {
+        const hoverId = hitTestLayer(coords.x, coords.y);
+        if (hoverId) {
+          setCanvasCursor('move');
+        } else {
+          setCanvasCursor('default');
+        }
+      }
+      return;
+    }
+
+    if (dragHandle === 'pan') {
+      const dx = e.clientX - dragStart.x;
+      const dy = e.clientY - dragStart.y;
+      onPanChange({ x: panOffset.x + dx, y: panOffset.y + dy });
+      setDragStart({ x: e.clientX, y: e.clientY });
+      return;
+    }
+
+    if (!selectedLayer || !initialTransform) return;
+
+    const coords = clientToCanvasCoords(e.clientX, e.clientY);
+    const deltaX = coords.x - dragStart.x;
+    const deltaY = coords.y - dragStart.y;
+
+    const isBulk = activeSelectedIds.length > 1 && onBulkUpdateTransforms;
+
+    if (dragHandle === 'move') {
+      if (isBulk) {
+        // Bulk move all selected layers simultaneously
+        const updates = activeSelectedIds.map(id => {
+          const orig = initialTransformsMap[id] || layers.find(l => l.id === id)?.transform;
+          if (!orig) return null;
+          return {
+            id,
+            transform: {
+              x: Math.round(orig.x + deltaX),
+              y: Math.round(orig.y + deltaY)
+            }
+          };
+        }).filter(Boolean) as Array<{ id: string; transform: Partial<EditableLayer['transform']> }>;
+
+        onBulkUpdateTransforms(updates);
+      } else {
+        let newX = Math.round(initialTransform.x + deltaX);
+        let newY = Math.round(initialTransform.y + deltaY);
+
+        // Smart Snapping to Canvas Center / Borders
+        const guides: GuideLine[] = [];
+        const cx = newX + selectedLayer.initialBounds.width / 2;
+        const cy = newY + selectedLayer.initialBounds.height / 2;
+        const snapThreshold = 6;
+
+        // Horizontal Center snap
+        if (Math.abs(cx - project.width / 2) <= snapThreshold) {
+          newX = Math.round(project.width / 2 - selectedLayer.initialBounds.width / 2);
+          guides.push({ type: 'vertical', position: project.width / 2 });
+        }
+        // Vertical Center snap
+        if (Math.abs(cy - project.height / 2) <= snapThreshold) {
+          newY = Math.round(project.height / 2 - selectedLayer.initialBounds.height / 2);
+          guides.push({ type: 'horizontal', position: project.height / 2 });
+        }
+
+        setActiveGuides(guides);
+        onUpdateLayerTransform(selectedLayer.id, { x: newX, y: newY });
+      }
+    } else if (dragHandle === 'rot') {
+      // Rotation Handle Dragging
+      const pivotX = selectedLayer.initialBounds.x + selectedLayer.initialBounds.width / 2;
+      const pivotY = selectedLayer.initialBounds.y + selectedLayer.initialBounds.height / 2;
+      const centerCanvasX = pivotX + (initialTransform.x - selectedLayer.initialBounds.x);
+      const centerCanvasY = pivotY + (initialTransform.y - selectedLayer.initialBounds.y);
+
+      const angleRad = Math.atan2(coords.y - centerCanvasY, coords.x - centerCanvasX);
+      let angleDeg = Math.round((angleRad * 180) / Math.PI) + 90;
+      if (angleDeg > 180) angleDeg -= 360;
+      if (angleDeg < -180) angleDeg += 360;
+
+      // Snap to 45 degree increments if shift is pressed
+      if (e.shiftKey) {
+        angleDeg = Math.round(angleDeg / 45) * 45;
+      }
+
+      if (isBulk) {
+        const rotDelta = angleDeg - initialTransform.rotation;
+        const updates = activeSelectedIds.map(id => {
+          const orig = initialTransformsMap[id] || layers.find(l => l.id === id)?.transform;
+          if (!orig) return null;
+          return {
+            id,
+            transform: {
+              rotation: Math.round((orig.rotation + rotDelta) % 360)
+            }
+          };
+        }).filter(Boolean) as Array<{ id: string; transform: Partial<EditableLayer['transform']> }>;
+
+        onBulkUpdateTransforms(updates);
+      } else {
+        onUpdateLayerTransform(selectedLayer.id, { rotation: angleDeg });
+      }
+    } else if (['nw', 'ne', 'se', 'sw', 'n', 's', 'e', 'w'].includes(dragHandle || '')) {
+      // Scaling Resize Handles
+      const initW = Math.max(10, selectedLayer.initialBounds.width);
+      const initH = Math.max(10, selectedLayer.initialBounds.height);
+      const origW = initW * initialTransform.scaleX;
+      const origH = initH * initialTransform.scaleY;
+
+      // Inverse-rotate the delta to local layer coordinates
+      const angleRad = (-initialTransform.rotation * Math.PI) / 180;
+      const cosA = Math.cos(angleRad);
+      const sinA = Math.sin(angleRad);
+      const localDeltaX = deltaX * cosA - deltaY * sinA;
+      const localDeltaY = deltaX * sinA + deltaY * cosA;
+
+      const isEdgeHandle = ['n', 's', 'e', 'w'].includes(dragHandle || '');
+
+      let newScaleX = initialTransform.scaleX;
+      let newScaleY = initialTransform.scaleY;
+      let newW = origW;
+      let newH = origH;
+      let localShiftX = 0;
+      let localShiftY = 0;
+
+      if (isEdgeHandle) {
+        // 4-Directional Pure Single-Axis Stretches (Edge Midpoints: n, s, e, w)
+        // Stretches/compresses purely along that single direction, never forcing both dimensions together
+        if (dragHandle === 'e') {
+          newW = Math.max(5, origW + (e.altKey ? localDeltaX * 2 : localDeltaX));
+          newScaleX = newW / initW;
+          localShiftX = e.altKey ? 0 : (newW - origW) / 2;
+        } else if (dragHandle === 'w') {
+          newW = Math.max(5, origW - (e.altKey ? localDeltaX * 2 : localDeltaX));
+          newScaleX = newW / initW;
+          localShiftX = e.altKey ? 0 : -(newW - origW) / 2;
+        } else if (dragHandle === 's') {
+          newH = Math.max(5, origH + (e.altKey ? localDeltaY * 2 : localDeltaY));
+          newScaleY = newH / initH;
+          localShiftY = e.altKey ? 0 : (newH - origH) / 2;
+        } else if (dragHandle === 'n') {
+          newH = Math.max(5, origH - (e.altKey ? localDeltaY * 2 : localDeltaY));
+          newScaleY = newH / initH;
+          localShiftY = e.altKey ? 0 : -(newH - origH) / 2;
+        }
+      } else {
+        // Corner handles (nw, ne, se, sw)
+        let factorX = 1;
+        let factorY = 1;
+        if (dragHandle?.includes('e')) factorX = 1 + (localDeltaX * 2) / (initW * initialTransform.scaleX);
+        if (dragHandle?.includes('w')) factorX = 1 - (localDeltaX * 2) / (initW * initialTransform.scaleX);
+        if (dragHandle?.includes('s')) factorY = 1 + (localDeltaY * 2) / (initH * initialTransform.scaleY);
+        if (dragHandle?.includes('n')) factorY = 1 - (localDeltaY * 2) / (initH * initialTransform.scaleY);
+
+        if (selectedLayer.aspectRatioLocked || e.shiftKey) {
+          const factor = Math.max(factorX, factorY);
+          factorX = factor;
+          factorY = factor;
+        }
+
+        const multX = Math.max(0.05, factorX);
+        const multY = Math.max(0.05, factorY);
+        newScaleX = Math.max(0.05, Math.min(10, initialTransform.scaleX * multX));
+        newScaleY = Math.max(0.05, Math.min(10, initialTransform.scaleY * multY));
+        newW = Math.round(initW * newScaleX);
+        newH = Math.round(initH * newScaleY);
+      }
+
+      // Convert local shift to world canvas coordinates
+      const rotRad = (initialTransform.rotation * Math.PI) / 180;
+      const worldShiftX = localShiftX * Math.cos(rotRad) - localShiftY * Math.sin(rotRad);
+      const worldShiftY = localShiftX * Math.sin(rotRad) + localShiftY * Math.cos(rotRad);
+      const newX = Math.round(initialTransform.x + worldShiftX);
+      const newY = Math.round(initialTransform.y + worldShiftY);
+
+      if (isBulk) {
+        const multX = newScaleX / initialTransform.scaleX;
+        const multY = newScaleY / initialTransform.scaleY;
+        const updates = activeSelectedIds.map(id => {
+          const orig = initialTransformsMap[id] || layers.find(l => l.id === id)?.transform;
+          const targetL = layers.find(l => l.id === id);
+          if (!orig || !targetL) return null;
+          const targetInitW = Math.max(10, targetL.initialBounds.width);
+          const targetInitH = Math.max(10, targetL.initialBounds.height);
+          const sX = Math.max(0.05, Math.min(10, orig.scaleX * multX));
+          const sY = Math.max(0.05, Math.min(10, orig.scaleY * multY));
+          return {
+            id,
+            transform: {
+              x: Math.round(orig.x + worldShiftX),
+              y: Math.round(orig.y + worldShiftY),
+              scaleX: parseFloat(sX.toFixed(3)),
+              scaleY: parseFloat(sY.toFixed(3)),
+              width: Math.round(targetInitW * sX),
+              height: Math.round(targetInitH * sY)
+            }
+          };
+        }).filter(Boolean) as Array<{ id: string; transform: Partial<EditableLayer['transform']> }>;
+
+        onBulkUpdateTransforms(updates);
+      } else {
+        onUpdateLayerTransform(selectedLayer.id, {
+          x: newX,
+          y: newY,
+          scaleX: parseFloat(newScaleX.toFixed(3)),
+          scaleY: parseFloat(newScaleY.toFixed(3)),
+          width: Math.round(newW),
+          height: Math.round(newH)
+        });
+      }
+    }
+  };
+
+  // Mouse Up Handler
+  const handleMouseUp = () => {
+    setIsInteracting(false);
+    setDragHandle(null);
+    setInitialTransform(null);
+    setActiveGuides([]);
+  };
+
+  // Wheel Zoom / Pan
+  const handleWheel = (e: React.WheelEvent) => {
+    e.preventDefault();
+    if (e.ctrlKey || e.metaKey) {
+      const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
+      const newZoom = Math.max(15, Math.min(500, Math.round(zoom * zoomFactor)));
+      onZoomChange(newZoom);
+    } else {
+      onPanChange({
+        x: panOffset.x - e.deltaX * 0.8,
+        y: panOffset.y - e.deltaY * 0.8
+      });
+    }
+  };
+
+  return (
+    <div 
+      ref={containerRef}
+      className="relative w-full h-full bg-[#050811] overflow-hidden flex items-center justify-center select-none"
+      onMouseDown={handleMouseDown}
+      onMouseMove={handleMouseMove}
+      onMouseUp={handleMouseUp}
+      onMouseLeave={() => {
+        handleMouseUp();
+        setChromaLoupe(null);
+        onChromaHoverColor?.(null);
+      }}
+      onWheel={handleWheel}
+      style={{ cursor: activeTool === 'hand' || dragHandle === 'pan' ? 'grab' : canvasCursor }}
+    >
+      {/* Floating Canvas Viewport Info Pill & Dimension Control & Preset Quick Zoom */}
+      <div className="absolute top-4 left-4 z-20 flex items-center gap-2 bg-slate-900/90 backdrop-blur-md border border-white/10 p-1.5 px-3 rounded-2xl shadow-xl">
+        {/* Interactive Dimension Control Button */}
+        <div className="relative">
+          <button
+            onClick={() => setShowDimensionsMenu(prev => !prev)}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-indigo-500/15 hover:bg-indigo-500/30 border border-indigo-500/40 hover:border-indigo-400 text-indigo-200 hover:text-white transition-all cursor-pointer font-mono font-bold text-xs shadow-sm hover:scale-[1.02] active:scale-95"
+            title="تعديل وتحديد مقاسات المشروع بحرية (العرض × الارتفاع)"
+          >
+            <Scaling size={13} className="text-indigo-400" />
+            <span>{project.width} × {project.height} px</span>
+            <ChevronDown size={11} className={`text-indigo-400/80 transition-transform ${showDimensionsMenu ? 'rotate-180' : ''}`} />
+          </button>
+
+          {/* Popover / Menu for Dimensions */}
+          {showDimensionsMenu && (
+            <div 
+              className="absolute top-full left-0 mt-2 w-80 bg-slate-900/95 backdrop-blur-xl border border-indigo-500/30 rounded-2xl shadow-2xl p-4 z-50 text-right animate-in fade-in zoom-in-95 duration-150 ring-1 ring-white/10"
+              onClick={(e) => e.stopPropagation()}
+              dir="rtl"
+            >
+              <div className="flex items-center justify-between pb-2.5 border-b border-white/10 mb-3">
+                <div className="flex items-center gap-1.5">
+                  <div className="w-6 h-6 rounded-lg bg-indigo-500/20 text-indigo-300 flex items-center justify-center border border-indigo-500/30">
+                    <Scaling size={13} className="text-indigo-400" />
+                  </div>
+                  <div>
+                    <span className="text-xs font-black text-white block">مقاس وأبعاد المشروع</span>
+                    <span className="text-[9px] text-slate-400">تحكم كامل بحرية دون التقيد برقم معين</span>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setShowDimensionsMenu(false)}
+                  className="p-1 hover:bg-white/10 text-slate-400 hover:text-white rounded-lg text-xs cursor-pointer transition-colors"
+                  title="إغلاق"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+
+              {/* Direct Custom Dimension Inputs */}
+              <div className="space-y-3">
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="text-[10px] font-bold text-slate-300 mb-1 block">العرض (Width):</label>
+                    <div className="flex items-center bg-black/60 border border-indigo-400/30 rounded-xl px-2.5 py-1.5 focus-within:border-indigo-400 focus-within:ring-1 focus-within:ring-indigo-400/50">
+                      <input
+                        type="number"
+                        min={10}
+                        max={8192}
+                        value={customWidthInput}
+                        onChange={(e) => {
+                          const w = parseInt(e.target.value) || 0;
+                          setCustomWidthInput(w);
+                          if (lockRatio && project.width > 0 && w > 0) {
+                            const ratio = project.height / project.width;
+                            setCustomHeightInput(Math.round(w * ratio));
+                          }
+                        }}
+                        className="w-full bg-transparent text-white font-mono font-bold text-xs focus:outline-none text-center"
+                        placeholder="العرض"
+                      />
+                      <span className="text-[10px] text-indigo-400 font-mono">px</span>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="text-[10px] font-bold text-slate-300 mb-1 block">الارتفاع (Height):</label>
+                    <div className="flex items-center bg-black/60 border border-indigo-400/30 rounded-xl px-2.5 py-1.5 focus-within:border-indigo-400 focus-within:ring-1 focus-within:ring-indigo-400/50">
+                      <input
+                        type="number"
+                        min={10}
+                        max={8192}
+                        value={customHeightInput}
+                        onChange={(e) => {
+                          const h = parseInt(e.target.value) || 0;
+                          setCustomHeightInput(h);
+                          if (lockRatio && project.height > 0 && h > 0) {
+                            const ratio = project.width / project.height;
+                            setCustomWidthInput(Math.round(h * ratio));
+                          }
+                        }}
+                        className="w-full bg-transparent text-white font-mono font-bold text-xs focus:outline-none text-center"
+                        placeholder="الارتفاع"
+                      />
+                      <span className="text-[10px] text-indigo-400 font-mono">px</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Aspect Ratio Lock Toggle */}
+                <div className="flex items-center justify-between px-1 py-0.5">
+                  <button
+                    type="button"
+                    onClick={() => setLockRatio(prev => !prev)}
+                    className={`flex items-center gap-1.5 px-2 py-1 rounded-lg text-[10px] font-bold border transition-all cursor-pointer ${
+                      lockRatio 
+                        ? 'bg-indigo-500/20 text-indigo-300 border-indigo-500/40' 
+                        : 'bg-white/5 text-slate-400 border-white/5 hover:text-slate-200'
+                    }`}
+                  >
+                    {lockRatio ? <Lock size={11} className="text-indigo-400" /> : <Unlock size={11} />}
+                    <span>{lockRatio ? 'النسبة مقفلة (تناسب طردي)' : 'النسبة حرة (غير مقفلة)'}</span>
+                  </button>
+                  <span className="text-[9.5px] font-mono text-slate-400">
+                    النسبة: {project.width && project.height ? (project.width / project.height).toFixed(2) : '1.00'}
+                  </span>
+                </div>
+
+                {/* Quick Presets Grid */}
+                <div className="space-y-1.5 pt-1 border-t border-white/10">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-bold text-slate-400">مقاسات سريعة شائعة:</span>
+                    <span className="text-[9px] text-indigo-400 font-mono">نقرة واحدة للتطبيق</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-1.5 max-h-32 overflow-y-auto custom-scrollbar pr-0.5">
+                    {[
+                      { label: '750 × 1334 (قصة / هاتف)', w: 750, h: 1334 },
+                      { label: '1080 × 1920 (9:16 FHD)', w: 1080, h: 1920 },
+                      { label: '500 × 500 (مربع افتراضي)', w: 500, h: 500 },
+                      { label: '750 × 240 (بانر روم البث)', w: 750, h: 240 },
+                      { label: '1920 × 1080 (16:9 شاشة)', w: 1920, h: 1080 },
+                      { label: '1080 × 1080 (1:1 HD)', w: 1080, h: 1080 },
+                      { label: '720 × 1280 (HD عمودي)', w: 720, h: 1280 },
+                      { label: '400 × 400 (أيقونة / شارة)', w: 400, h: 400 }
+                    ].map((p) => (
+                      <button
+                        key={`${p.w}x${p.h}`}
+                        type="button"
+                        onClick={() => {
+                          setCustomWidthInput(p.w);
+                          setCustomHeightInput(p.h);
+                          if (onUpdateProjectDimensions) {
+                            onUpdateProjectDimensions(p.w, p.h, scaleLayersWithResize);
+                          }
+                        }}
+                        className={`text-right px-2 py-1.5 rounded-xl text-[10px] font-mono transition-all border cursor-pointer ${
+                          project.width === p.w && project.height === p.h
+                            ? 'bg-indigo-600 text-white border-indigo-400 font-bold shadow-sm'
+                            : 'bg-white/5 hover:bg-white/10 text-slate-300 border-white/5 hover:border-white/15'
+                        }`}
+                      >
+                        {p.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Options & Apply Button */}
+                <div className="pt-2 border-t border-white/10 flex items-center justify-between gap-2">
+                  <label className="text-[10px] text-slate-300 flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={scaleLayersWithResize}
+                      onChange={(e) => setScaleLayersWithResize(e.target.checked)}
+                      className="rounded accent-indigo-500 cursor-pointer"
+                    />
+                    <span>تحجيم الطبقات تلقائياً</span>
+                  </label>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (onUpdateProjectDimensions && customWidthInput > 0 && customHeightInput > 0) {
+                        onUpdateProjectDimensions(customWidthInput, customHeightInput, scaleLayersWithResize);
+                        setShowDimensionsMenu(false);
+                      }
+                    }}
+                    className="px-3.5 py-1.5 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-indigo-600/30 flex items-center gap-1.5 cursor-pointer hover:scale-105 active:scale-95"
+                  >
+                    <Check size={13} />
+                    <span>تطبيق المقاس</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="h-3 w-px bg-white/10" />
+        <span className="text-[11px] font-mono text-indigo-400 font-bold">{zoom}%</span>
+
+        <div className="h-3 w-px bg-white/10" />
+
+        {/* Quick presets */}
+        <div className="flex items-center gap-1">
+          {[25, 50, 100, 200, 400, 800].map(pz => (
+            <button
+              key={pz}
+              onClick={() => onZoomChange(pz)}
+              className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-bold transition-colors cursor-pointer ${
+                zoom === pz ? 'bg-indigo-600 text-white' : 'bg-white/5 text-slate-400 hover:text-white'
+              }`}
+              title={`مستوى التكبير ${pz}%`}
+            >
+              {pz}%
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Floating Zoom & Reset Toolbar with Slider, Focus on Selection and Fit */}
+      <div className="absolute bottom-4 right-4 z-20 flex items-center gap-2 bg-slate-900/90 backdrop-blur-md border border-white/10 p-1.5 px-2.5 rounded-2xl shadow-xl">
+        <button
+          onClick={() => onZoomChange(Math.max(10, zoom - 25))}
+          className="p-1.5 hover:bg-white/10 text-slate-400 hover:text-white rounded-xl transition-colors cursor-pointer"
+          title="تصغير (Zoom Out)"
+        >
+          <ZoomOut size={14} />
+        </button>
+
+        {/* Live Smooth Zoom Slider up to 800% */}
+        <div className="flex items-center gap-1.5 w-24">
+          <input
+            type="range"
+            min={10}
+            max={800}
+            step={10}
+            value={zoom}
+            onChange={(e) => onZoomChange(parseInt(e.target.value) || 100)}
+            className="w-full h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+            title={`مستوى التكبير: ${zoom}%`}
+          />
+        </div>
+
+        <button
+          onClick={() => {
+            onZoomChange(100);
+            onPanChange({ x: 0, y: 0 });
+          }}
+          className="px-2 py-1 bg-white/5 hover:bg-white/10 text-[10px] font-mono font-bold text-slate-300 rounded-lg transition-colors cursor-pointer"
+          title="إعادة ضبط الحجم (100%)"
+        >
+          100%
+        </button>
+
+        <button
+          onClick={() => onZoomChange(Math.min(800, zoom + 25))}
+          className="p-1.5 hover:bg-white/10 text-slate-400 hover:text-white rounded-xl transition-colors cursor-pointer"
+          title="تكبير (Zoom In)"
+        >
+          <ZoomIn size={14} />
+        </button>
+
+        <div className="h-3 w-px bg-white/10 mx-0.5" />
+
+        {/* Focus / Zoom to Selected Layer */}
+        {selectedLayer && (
+          <button
+            onClick={handleZoomToSelection}
+            className="px-2 py-1 bg-purple-600/30 hover:bg-purple-600/50 text-[10px] font-bold text-purple-300 rounded-lg transition-colors cursor-pointer flex items-center gap-1 border border-purple-500/30"
+            title="تكبير والتركيز على الطبقة المحددة (Focus Selected Layer)"
+          >
+            <Focus size={12} />
+            <span>تكبير على العنصر</span>
+          </button>
+        )}
+
+        {/* Auto Fit to Screen Button */}
+        <button
+          onClick={() => {
+            if (!containerRef.current) return;
+            const cw = containerRef.current.clientWidth - 80;
+            const ch = containerRef.current.clientHeight - 80;
+            if (cw > 0 && ch > 0 && project.width > 0 && project.height > 0) {
+              const sw = cw / project.width;
+              const sh = ch / project.height;
+              const fit = Math.max(10, Math.min(400, Math.round(Math.min(sw, sh) * 100)));
+              onZoomChange(fit);
+              onPanChange({ x: 0, y: 0 });
+            }
+          }}
+          className="px-2 py-1 bg-indigo-600/30 hover:bg-indigo-600/50 text-[10px] font-bold text-indigo-300 rounded-lg transition-colors cursor-pointer flex items-center gap-1 border border-indigo-500/30"
+          title="ملاءمة الكانفاس لحجم الشاشة (Fit to View)"
+        >
+          <Maximize2 size={11} />
+          <span>ملاءمة</span>
+        </button>
+
+        <button
+          onClick={() => onPanChange({ x: 0, y: 0 })}
+          className="p-1.5 hover:bg-white/10 text-slate-400 hover:text-white rounded-xl transition-colors cursor-pointer"
+          title="توسيط الكانفاس (Center Pan)"
+        >
+          <RotateCcw size={14} />
+        </button>
+      </div>
+
+      {/* Active Selected Layer Banner */}
+      {selectedLayer && (
+        <div className="absolute top-4 right-4 z-20 flex items-center gap-2 bg-slate-900/90 border border-indigo-500/30 text-indigo-300 backdrop-blur-md px-3 py-1.5 rounded-2xl shadow-xl text-xs" dir="rtl">
+          <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse" />
+          <span className="font-bold text-white max-w-[180px] truncate">{selectedLayer.name}</span>
+          <span className="text-[10px] font-mono text-indigo-300 bg-indigo-500/20 px-2 py-0.5 rounded-md">
+            X:{Math.round(selectedLayer.transform.x)} Y:{Math.round(selectedLayer.transform.y)}
+          </span>
+          <button
+            onClick={handleZoomToSelection}
+            className="px-2 py-0.5 bg-indigo-600/30 hover:bg-indigo-600 text-[10px] font-bold text-indigo-200 hover:text-white rounded-md transition-colors flex items-center gap-1 cursor-pointer"
+            title="تكبير الكانفاس على العنصر"
+          >
+            <Focus size={10} />
+            <span>تكبير</span>
+          </button>
+        </div>
+      )}
+
+      {/* The Interactive Canvas Element */}
+      <div
+        className="relative transition-transform duration-75 shadow-2xl rounded-sm overflow-hidden"
+        style={{
+          transform: `translate(${panOffset.x}px, ${panOffset.y}px) scale(${zoom / 100})`,
+          transformOrigin: 'center center',
+          width: `${project.width}px`,
+          height: `${project.height}px`
+        }}
+      >
+        <canvas
+          ref={canvasRef}
+          width={project.width}
+          height={project.height}
+          className="block pointer-events-none"
+        />
+      </div>
+
+      {/* Interactive Smart Chroma Magnifier Loupe */}
+      {activeTool === 'chroma-pen' && chromaLoupe && (
+        <div 
+          className="fixed pointer-events-none z-50 transform -translate-x-1/2 -translate-y-full mb-3 flex flex-col items-center animate-in fade-in zoom-in-90 duration-75"
+          style={{
+            left: `${chromaLoupe.clientX}px`,
+            top: `${chromaLoupe.clientY - 16}px`
+          }}
+        >
+          {/* Loupe Outer Glow Ring */}
+          <div 
+            className="relative w-20 h-20 rounded-full border-[3px] shadow-2xl overflow-hidden flex items-center justify-center bg-black/95 ring-2 ring-white/20"
+            style={{
+              borderColor: chromaLoupe.color.hex,
+              boxShadow: `0 0 24px ${chromaLoupe.color.hex}99, 0 10px 30px rgba(0,0,0,0.85)`
+            }}
+          >
+            {/* Precision Crosshairs */}
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-20">
+              <div className="w-full h-px bg-white/70" />
+              <div className="h-full w-px bg-white/70 absolute" />
+              <div className="w-3.5 h-3.5 rounded-full border border-white shadow-sm" />
+            </div>
+
+            {/* Target Color Swatch fill */}
+            <div 
+              className="w-full h-full"
+              style={{ backgroundColor: chromaLoupe.color.hex }}
+            />
+          </div>
+
+          {/* Color Pill Tag */}
+          <div className="mt-2 flex flex-col items-center bg-slate-950/95 border border-white/20 px-3 py-1.5 rounded-2xl shadow-2xl backdrop-blur-md text-center ring-1 ring-emerald-500/30">
+            <div className="flex items-center gap-1.5">
+              <span 
+                className="w-2.5 h-2.5 rounded-full border border-white/40 shadow-sm"
+                style={{ backgroundColor: chromaLoupe.color.hex }}
+              />
+              <span className="font-mono text-xs font-black text-white">{chromaLoupe.color.hex}</span>
+            </div>
+            <span className="text-[10px] font-bold text-emerald-400 mt-0.5">
+              {identifyColorType(chromaLoupe.color.r, chromaLoupe.color.g, chromaLoupe.color.b).label}
+            </span>
+            <span className="text-[9px] text-slate-300 font-medium">انقر بالماوس لحذف هذا اللون</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};

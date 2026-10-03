@@ -1,0 +1,6 @@
+{
+  "name": "Jiawei Effects Clone & Gifts Dashboard",
+  "description": "Full replica of the live-streaming gift VFX platform with Arabic support, simplified interface, gift and order upload dashboard, external video CDN links, instant delivery boxes, and comprehensive printing for tax invoices and license certificates.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

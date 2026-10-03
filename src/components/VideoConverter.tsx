@@ -1,0 +1,4143 @@
+import React, { useState, useRef, useEffect } from "react";
+import { motion, AnimatePresence } from "motion/react";
+import { FFmpeg } from "@ffmpeg/ffmpeg";
+import { fetchFile } from "@ffmpeg/util";
+import { loadFFmpegWithFallbacks } from "../utils/ffmpegLoader";
+import { FileMetadata, UserRecord } from "../types";
+import {
+  Video,
+  Box,
+  Image as ImageIcon,
+  Film,
+  Download,
+  Settings2,
+  Zap,
+  ChevronLeft,
+  Maximize,
+  Moon,
+  Layers,
+  Music,
+  Trash2,
+  Clock,
+  Scissors,
+  X,
+  Pipette,
+  Sparkles,
+  Palette,
+  Crosshair,
+  FastForward,
+  Crown,
+  RefreshCw,
+  ArrowLeft,
+  CheckCircle2,
+} from "lucide-react";
+import { logActivity } from "../utils/logger";
+import { ChromaStudioModal, ChromaSettings } from "./ChromaStudioModal";
+import {
+  VideoTrimmerModal,
+  TimingSettings,
+  DEFAULT_TIMING_SETTINGS,
+  calculateOutputDuration,
+  getTimeForFrame,
+} from "./VideoTrimmerModal";
+import { VideoDurationSpeedModal } from "./VideoDurationSpeedModal";
+import { extractAndScaleVideoAudio } from "../utils/videoDurationEngine";
+import { ensureMp3WithId3 } from "../utils/svgaAudio";
+import { transferVideoEditsToLayerEditor } from "../utils/transferToLayerEditor";
+
+import * as Mp4Muxer from "mp4-muxer";
+import { downloadDesignerInfoFile } from "../utils/designerInfo";
+
+declare var SVGA: any;
+declare var protobuf: any;
+declare var pako: any;
+declare var GIF: any;
+declare var UPNG: any;
+declare var WebMMuxer: any;
+
+import { useAccessControl } from "../hooks/useAccessControl";
+import { extractAudioInBrowser } from "../utils/clientAudio";
+
+import { calculateSafeDimensions } from "../utils/dimensions";
+
+interface VideoConverterProps {
+  currentUser: UserRecord | null;
+  onCancel: () => void;
+  onLoginRequired: () => void;
+  onSubscriptionRequired: () => void;
+  globalQuality?: "low" | "medium" | "high";
+  initialFiles?: File[];
+  onOpenLayerEditor?: (params: { project?: any; layers?: any[]; file?: File }) => void;
+}
+
+export const VideoConverter: React.FC<VideoConverterProps> = ({
+  currentUser,
+  onCancel,
+  onLoginRequired,
+  onSubscriptionRequired,
+  globalQuality: initialGlobalQuality = "high",
+  initialFiles = [],
+  onOpenLayerEditor,
+}) => {
+  const { checkAccess } = useAccessControl();
+  const [files, setFiles] = useState<File[]>(initialFiles);
+  const [videoUrls, setVideoUrls] = useState<string[]>([]);
+  const [currentFileIndex, setCurrentFileIndex] = useState(0);
+  const [isMerging, setIsMerging] = useState(false);
+  const [generateChecksum, setGenerateChecksum] = useState(false);
+  const [startTime, setStartTime] = useState(0);
+  const [endTime, setEndTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [compressionQuality, setCompressionQuality] = useState(80);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [phase, setPhase] = useState("");
+  const [ffmpegLoaded, setFfmpegLoaded] = useState(false);
+  const ffmpegRef = useRef(new FFmpeg());
+  const [selectedFormat, setSelectedFormat] = useState("VAP (MP4)");
+  const [globalQuality, setGlobalQuality] = useState<"low" | "medium" | "high">(
+    initialGlobalQuality,
+  );
+  const [compressionRatio, setCompressionRatio] = useState<number>(100);
+  const [exportScale, setExportScale] = useState(1.0);
+  const [customWidth, setCustomWidth] = useState<number | "">("");
+  const [customHeight, setCustomHeight] = useState<number | "">("");
+  const [fps, setFps] = useState(30);
+  const [customBitrate, setCustomBitrate] = useState<number | "">("");
+  const [audioFile, setAudioFile] = useState<File | null>(null);
+  const [removeBlack, setRemoveBlack] = useState(false);
+  const [removeWhite, setRemoveWhite] = useState(false);
+  const [isVapInput, setIsVapInput] = useState(false);
+  const [isAutoDuration, setIsAutoDuration] = useState(true);
+  const [whiteTolerance, setWhiteTolerance] = useState(30);
+  const [removeGreen, setRemoveGreen] = useState(false);
+  const [removeBlue, setRemoveBlue] = useState(false);
+  const [customChroma, setCustomChroma] = useState<ChromaSettings>({
+    enabled: false,
+    color: "#00FF00",
+    r: 0,
+    g: 255,
+    b: 0,
+    tolerance: 35,
+    smoothness: 15,
+    despill: true,
+  });
+  const [showChromaStudio, setShowChromaStudio] = useState(false);
+  const [showTrimmer, setShowTrimmer] = useState(false);
+  const [showDurationSpeedModal, setShowDurationSpeedModal] = useState(false);
+  const [durationMode, setDurationMode] = useState<"auto" | "speed_fit" | "trim">("auto");
+  const [targetSpeedDuration, setTargetSpeedDuration] = useState<number>(10);
+  const [timingSettings, setTimingSettings] = useState<TimingSettings>(DEFAULT_TIMING_SETTINGS);
+  const [fadeConfig, setFadeConfig] = useState({
+    top: 0,
+    bottom: 0,
+    left: 0,
+    right: 0,
+  });
+
+  const file = files[currentFileIndex] || null;
+  const videoUrl = videoUrls[currentFileIndex] || null;
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const audioInputRef = useRef<HTMLInputElement>(null);
+
+  // States for transferring edits to After Effects / SVGA Layer Editor
+  const [isTransferringToAe, setIsTransferringToAe] = useState(false);
+  const [aeTransferProgress, setAeTransferProgress] = useState(0);
+  const [aeTransferPhase, setAeTransferPhase] = useState("");
+  const [aeTransferSuccess, setAeTransferSuccess] = useState(false);
+
+  const handleTransferCurrentFileToAfterEffects = async (targetIndex?: number) => {
+    const idx = targetIndex !== undefined ? targetIndex : currentFileIndex;
+    const targetFile = files[idx];
+    if (!targetFile) {
+      alert("يرجى اختيار أو رفع فيديو أولاً ليتم نقله إلى محرر الطبقات");
+      return;
+    }
+
+    const isVIP = !!(currentUser?.isVIP || currentUser?.role === "admin" || currentUser?.isSuperAdmin);
+    if (!isVIP) {
+      onSubscriptionRequired();
+      return;
+    }
+
+    setIsTransferringToAe(true);
+    setAeTransferProgress(5);
+    setAeTransferPhase("جاري فحص إعدادات القص وإزالة الخلفية...");
+    setAeTransferSuccess(false);
+
+    try {
+      const result = await transferVideoEditsToLayerEditor({
+        file: targetFile,
+        videoDuration: duration || 5,
+        timingSettings,
+        isAutoDuration,
+        startTime,
+        endTime,
+        durationMode,
+        targetSpeedDuration,
+        fps: fps || 30,
+        customWidth,
+        customHeight,
+        exportScale,
+        isVapInput,
+        removeGreen,
+        removeBlack,
+        removeWhite,
+        removeBlue,
+        whiteTolerance,
+        customChroma,
+        fadeConfig,
+        onProgress: (p, pct) => {
+          setAeTransferPhase(p);
+          setAeTransferProgress(pct);
+        },
+      });
+
+      setAeTransferSuccess(true);
+      setAeTransferProgress(100);
+      setAeTransferPhase("تم حفظ ونقل كافة التعديلات بنجاح! جاري الفتح في محرر الطبقات (After Effects)...");
+
+      setTimeout(() => {
+        setIsTransferringToAe(false);
+        if (onOpenLayerEditor) {
+          onOpenLayerEditor({
+            project: result.project,
+            layers: result.layers,
+            file: result.file,
+          });
+        }
+      }, 700);
+    } catch (err: any) {
+      console.error("Failed to transfer to After Effects / Layer Editor:", err);
+      alert("حدث خطأ أثناء نقل المشروع إلى محرر الطبقات: " + (err.message || String(err)));
+      setIsTransferringToAe(false);
+    }
+  };
+
+  const [hiddenFormats, setHiddenFormats] = useState<string[]>(() => {
+    const saved = localStorage.getItem("quantum_hidden_formats");
+    return saved ? JSON.parse(saved) : [];
+  });
+
+  useEffect(() => {
+    const loadFFmpeg = async () => {
+      try {
+        await loadFFmpegWithFallbacks(ffmpegRef.current, (msg) => {
+          console.log(msg);
+        });
+        setFfmpegLoaded(true);
+      } catch (err) {
+        console.error("FFmpeg Load Error:", err);
+      }
+    };
+    loadFFmpeg();
+  }, []);
+
+  useEffect(() => {
+    const handleStorage = () => {
+      const saved = localStorage.getItem("quantum_hidden_formats");
+      if (saved) setHiddenFormats(JSON.parse(saved));
+    };
+    window.addEventListener("storage", handleStorage);
+    return () => window.removeEventListener("storage", handleStorage);
+  }, []);
+
+  const formats = [
+    {
+      id: "SVGA → YYEVA",
+      name: "SVGA → YYEVA",
+      icon: "🎬",
+      cost: 1,
+      desc: "تحويل الفيديو إلى صيغة YYEVA",
+    },
+    {
+      id: "VAP (MP4)",
+      name: "VAP (Alpha+RGB)",
+      icon: "📹",
+      cost: 1,
+      desc: "فيديو مع قناة شفافية منفصلة",
+    },
+    {
+      id: "VAP 1.0.5",
+      name: "VAP 1.0.5 (Special)",
+      icon: "🚀",
+      cost: 1,
+      desc: "تصدير خاص VAP 1.0.5",
+    },
+    {
+      id: "SVGA 2.0",
+      name: "SVGA Animation",
+      icon: "📦",
+      cost: 1,
+      desc: "ملف SVGA متوافق مع تطبيقات البث",
+    },
+    {
+      id: "GIF (Animation)",
+      name: "GIF الشفاف",
+      icon: "🖼️",
+      cost: 1,
+      desc: "صور متحركة للمواقع والدردشة",
+    },
+    {
+      id: "APNG (Animation)",
+      name: "APNG الشفاف",
+      icon: "🎞️",
+      cost: 1,
+      desc: "جودة أعلى من GIF مع شفافية كاملة",
+    },
+    {
+      id: "WebP (Animated)",
+      name: "WebP متحرك",
+      icon: "💫",
+      cost: 1,
+      desc: "أفضل جودة وحجم للويب (Stickers)",
+    },
+    {
+      id: "WebM (Video)",
+      name: "WebM شفاف",
+      icon: "🎥",
+      cost: 1,
+      desc: "فيديو عالي الجودة للويب مع شفافية",
+    },
+  ].filter((f) => {
+    // Check local hidden formats
+    if (hiddenFormats.includes(f.id)) return false;
+
+    // Check admin restricted formats
+    if (currentUser?.allowedExportFormat) {
+      const allowed = Array.isArray(currentUser.allowedExportFormat)
+        ? currentUser.allowedExportFormat
+        : [currentUser.allowedExportFormat];
+      return allowed.includes(f.id);
+    }
+
+    return true;
+  });
+
+  useEffect(() => {
+    if (!formats.find((f) => f.id === selectedFormat) && formats.length > 0) {
+      setSelectedFormat(formats[0].id);
+    }
+  }, [formats, selectedFormat]);
+
+  const applyTransparencyEffects = (
+    ctx: CanvasRenderingContext2D,
+    width: number,
+    height: number,
+    configOverride?: typeof fadeConfig,
+  ) => {
+    const currentFade = configOverride || fadeConfig;
+    const hasFade = Boolean(currentFade && (currentFade.top > 0 || currentFade.bottom > 0 || currentFade.left > 0 || currentFade.right > 0));
+
+    // Fast path: If no background removal or fade is active, skip pixel processing
+    if (!removeBlack && !removeGreen && !removeBlue && !removeWhite && !customChroma.enabled && !hasFade) {
+      return;
+    }
+
+    const imageData = ctx.getImageData(0, 0, width, height);
+    const data = imageData.data;
+
+    // Helper for Protection Masks
+    const masks = customChroma.protectionMasks || [];
+    const getProtectionFactor = (px: number, py: number): number => {
+      if (!masks || masks.length === 0) return 0;
+      let maxProtection = 0;
+
+      for (const m of masks) {
+        if (m.type === "circle") {
+          const cx = m.x * width;
+          const cy = m.y * height;
+          const rx = (m.radiusX || 0.05) * width;
+          const ry = (m.radiusY || 0.05) * height;
+          const r = Math.max(rx, ry);
+
+          const dx = px - cx;
+          const dy = py - cy;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+
+          if (dist <= r) {
+            maxProtection = 1;
+            break;
+          } else if (m.feather > 0 && dist <= r + m.feather) {
+            const f = 1 - (dist - r) / m.feather;
+            if (f > maxProtection) maxProtection = f;
+          }
+        } else if (m.type === "rect") {
+          const cx = m.x * width;
+          const cy = m.y * height;
+          const w = (m.width || 0.1) * width;
+          const h = (m.height || 0.1) * height;
+          const left = cx - w / 2;
+          const top = cy - h / 2;
+          const right = cx + w / 2;
+          const bottom = cy + h / 2;
+
+          if (px >= left && px <= right && py >= top && py <= bottom) {
+            maxProtection = 1;
+            break;
+          } else if (m.feather > 0) {
+            const dx = Math.max(left - px, 0, px - right);
+            const dy = Math.max(top - py, 0, py - bottom);
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist <= m.feather) {
+              const f = 1 - dist / m.feather;
+              if (f > maxProtection) maxProtection = f;
+            }
+          }
+        } else if (m.type === "brush" && m.points && m.points.length > 0) {
+          const bRadius = m.brushRadius || 24;
+          for (const pt of m.points) {
+            const bx = pt.x * width;
+            const by = pt.y * height;
+            const dx = px - bx;
+            const dy = py - by;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+
+            if (dist <= bRadius) {
+              maxProtection = 1;
+              break;
+            } else if (m.feather > 0 && dist <= bRadius + m.feather) {
+              const f = 1 - (dist - bRadius) / m.feather;
+              if (f > maxProtection) maxProtection = f;
+            }
+          }
+          if (maxProtection >= 1) break;
+        }
+      }
+
+      return maxProtection;
+    };
+
+    const fadeTopLimit = (height * currentFade.top) / 100;
+    const fadeBottomLimit = height - (height * currentFade.bottom) / 100;
+    const fadeLeftLimit = (width * currentFade.left) / 100;
+    const fadeRightLimit = width - (width * currentFade.right) / 100;
+
+    for (let i = 0; i < data.length; i += 4) {
+      const x = (i / 4) % width;
+      const y = Math.floor(i / 4 / width);
+
+      let r = data[i];
+      let g = data[i + 1];
+      let b = data[i + 2];
+      let a = data[i + 3];
+
+      // 1. Edge Fade Calculation
+      let edgeAlpha = 1.0;
+      if (currentFade.top > 0 && y < fadeTopLimit)
+        edgeAlpha *= y / fadeTopLimit;
+      if (currentFade.bottom > 0 && y > fadeBottomLimit)
+        edgeAlpha *= (height - y) / (height - fadeBottomLimit);
+      if (currentFade.left > 0 && x < fadeLeftLimit)
+        edgeAlpha *= x / fadeLeftLimit;
+      if (currentFade.right > 0 && x > fadeRightLimit)
+        edgeAlpha *= (width - x) / (width - fadeRightLimit);
+
+      // 2. Remove Black Logic (Enhanced with Tolerance)
+      if (removeBlack) {
+        const brightness = (r + g + b) / 3;
+        const threshold = whiteTolerance * 3; // 30 -> 90
+        if (brightness < threshold) {
+          const factor = brightness / threshold;
+          a = Math.min(a, 255 * factor);
+
+          // Brighten to avoid dark fringes
+          const boost = 1.0 - factor;
+          r = Math.min(255, r + (255 - r) * boost * 0.8);
+          g = Math.min(255, g + (255 - g) * boost * 0.8);
+          b = Math.min(255, b + (255 - b) * boost * 0.8);
+        }
+      }
+
+      // 3. Remove Green Logic (Chroma Key with Tolerance)
+      if (removeGreen) {
+        // Adjust sensitivity based on tolerance
+        const sensitivity = Math.max(10, 70 - whiteTolerance);
+
+        if (g > 100 && g > r + sensitivity && g > b + sensitivity) {
+          const dominance = Math.min(g - Math.max(r, b), 100) / 100;
+          a = Math.min(a, 255 * (1 - dominance));
+
+          if (a < 255) {
+            g = Math.min(g, Math.max(r, b));
+          }
+        }
+      }
+
+      // 3.5 Remove Blue Logic (Chroma Key with Tolerance)
+      if (removeBlue) {
+        const sensitivity = Math.max(10, 70 - whiteTolerance);
+
+        if (b > 100 && b > r + sensitivity && b > g + sensitivity) {
+          const dominance = Math.min(b - Math.max(r, g), 100) / 100;
+          a = Math.min(a, 255 * (1 - dominance));
+
+          if (a < 255) {
+            b = Math.min(b, Math.max(r, g));
+          }
+        }
+      }
+
+      // 4. Remove White Logic (Professional & Color Safe)
+      if (removeWhite) {
+        const dist = Math.sqrt(
+          Math.pow(255 - r, 2) + Math.pow(255 - g, 2) + Math.pow(255 - b, 2),
+        );
+
+        const max = Math.max(r, g, b);
+        const min = Math.min(r, g, b);
+        const saturation = max - min;
+
+        if (saturation < 20) {
+          const threshold = whiteTolerance * 1.5;
+          const softness = 20;
+
+          if (dist < threshold) {
+            a = 0;
+          } else if (dist < threshold + softness) {
+            const factor = (dist - threshold) / softness;
+            a = Math.min(a, 255 * factor);
+          }
+        }
+      }
+
+      // 5. Custom Eyedropper / Chroma Studio Keying
+      if (customChroma.enabled) {
+        const targetList = [
+          { r: customChroma.r, g: customChroma.g, b: customChroma.b },
+          ...(customChroma.additionalColors || []),
+        ];
+        const tol = (customChroma.tolerance / 100) * 180;
+        const soft = (customChroma.smoothness / 100) * 60;
+
+        let minFactor = 1.0;
+        for (const target of targetList) {
+          const dr = r - target.r;
+          const dg = g - target.g;
+          const db = b - target.b;
+          const dist = Math.sqrt(0.299 * dr * dr + 0.587 * dg * dg + 0.114 * db * db);
+
+          let factor = 1.0;
+          if (dist < tol) {
+            factor = 0.0;
+          } else if (soft > 0 && dist < tol + soft) {
+            const t = (dist - tol) / soft;
+            factor = t * t * (3 - 2 * t);
+          }
+          if (factor < minFactor) {
+            minFactor = factor;
+          }
+        }
+
+        // Apply Protection Mask to custom chroma
+        const protectFactor = getProtectionFactor(x, y);
+        if (protectFactor > 0) {
+          minFactor = minFactor + (1.0 - minFactor) * protectFactor;
+        }
+
+        if (customChroma.despill && minFactor < 1.0 && protectFactor < 0.8) {
+          const maxTarget = Math.max(customChroma.r, customChroma.g, customChroma.b);
+          if (customChroma.g === maxTarget && customChroma.g > customChroma.r + 20) {
+            const maxOther = Math.max(r, b);
+            if (g > maxOther) g = maxOther;
+          } else if (customChroma.b === maxTarget && customChroma.b > customChroma.r + 20) {
+            const maxOther = Math.max(r, g);
+            if (b > maxOther) b = maxOther;
+          } else if (customChroma.r === maxTarget && customChroma.r > customChroma.g + 20) {
+            const maxOther = Math.max(g, b);
+            if (r > maxOther) r = maxOther;
+          }
+        }
+
+        a = Math.min(a, 255 * minFactor);
+      } else {
+        // If other background removal is active (like black or white), also respect protection masks
+        const protectFactor = getProtectionFactor(x, y);
+        if (protectFactor > 0 && a < 255) {
+          a = a + (255 - a) * protectFactor;
+        }
+      }
+
+      const finalAlpha = (a / 255) * edgeAlpha;
+      data[i] = r;
+      data[i + 1] = g;
+      data[i + 2] = b;
+      data[i + 3] = Math.round(finalAlpha * 255);
+    }
+    ctx.putImageData(imageData, 0, 0);
+  };
+
+  const drawVideoCentered = (
+    ctx: CanvasRenderingContext2D,
+    video: HTMLVideoElement,
+    targetWidth: number,
+    targetHeight: number,
+    isVap: boolean = false,
+  ) => {
+    if (isVap) {
+      const halfTargetW = targetWidth / 2;
+      const halfVideoW = video.videoWidth / 2;
+      const scale = Math.max(
+        halfTargetW / halfVideoW,
+        targetHeight / video.videoHeight,
+      );
+      const drawW = halfVideoW * scale;
+      const drawH = video.videoHeight * scale;
+      const drawX = (halfTargetW - drawW) / 2;
+      const drawY = (targetHeight - drawH) / 2;
+
+      // Draw Alpha (Left half of video -> Left half of canvas)
+      ctx.drawImage(
+        video,
+        0,
+        0,
+        halfVideoW,
+        video.videoHeight,
+        drawX,
+        drawY,
+        drawW,
+        drawH,
+      );
+      // Draw RGB (Right half of video -> Right half of canvas)
+      ctx.drawImage(
+        video,
+        halfVideoW,
+        0,
+        halfVideoW,
+        video.videoHeight,
+        halfTargetW + drawX,
+        drawY,
+        drawW,
+        drawH,
+      );
+    } else {
+      const scale = Math.max(
+        targetWidth / video.videoWidth,
+        targetHeight / video.videoHeight,
+      );
+      const drawW = video.videoWidth * scale;
+      const drawH = video.videoHeight * scale;
+      const drawX = (targetWidth - drawW) / 2;
+      const drawY = (targetHeight - drawH) / 2;
+      ctx.drawImage(video, drawX, drawY, drawW, drawH);
+    }
+  };
+
+  const captureFrame = async (
+    video: HTMLVideoElement,
+    ctx: CanvasRenderingContext2D,
+    tCtx: CanvasRenderingContext2D,
+    vw: number,
+    vh: number,
+    time: number,
+  ) => {
+    const clamped = Math.max(0, Math.min(video.duration || 9999, time));
+    if (Math.abs(video.currentTime - clamped) > 0.002) {
+      await new Promise((r) => {
+        let done = false;
+        const onSeek = () => {
+          if (!done) {
+            done = true;
+            video.removeEventListener("seeked", onSeek);
+            r(null);
+          }
+        };
+        video.addEventListener("seeked", onSeek, { once: true });
+        if ('fastSeek' in video && typeof (video as any).fastSeek === 'function') {
+          try {
+            (video as any).fastSeek(clamped);
+          } catch {
+            video.currentTime = clamped;
+          }
+        } else {
+          video.currentTime = clamped;
+        }
+        setTimeout(onSeek, 100);
+      });
+    }
+
+    ctx.clearRect(0, 0, vw, vh);
+
+    if (isVapInput) {
+      tCtx.clearRect(0, 0, tCtx.canvas.width, tCtx.canvas.height);
+      drawVideoCentered(
+        tCtx,
+        video,
+        tCtx.canvas.width,
+        tCtx.canvas.height,
+        true,
+      );
+      // VAP Input: Left half is Alpha, Right half is RGB
+      const alphaData = tCtx.getImageData(0, 0, vw, vh).data;
+      const rgbData = tCtx.getImageData(vw, 0, vw, vh).data;
+      const combinedData = ctx.createImageData(vw, vh);
+      const d = combinedData.data;
+
+      for (let j = 0; j < rgbData.length; j += 4) {
+        d[j] = rgbData[j]; // R
+        d[j + 1] = rgbData[j + 1]; // G
+        d[j + 2] = rgbData[j + 2]; // B
+        // Use grayscale value from alpha side as alpha
+        const alpha = ((alphaData[j] + alphaData[j + 1] + alphaData[j + 2]) / 3) | 0;
+        d[j + 3] = alpha;
+      }
+      ctx.putImageData(combinedData, 0, 0);
+    } else {
+      drawVideoCentered(
+        ctx,
+        video,
+        vw,
+        vh,
+        false,
+      );
+    }
+
+    // Apply transparency effects (Edge Fade, Chroma Key, etc.)
+    applyTransparencyEffects(ctx, vw, vh);
+  };
+
+  useEffect(() => {
+    if (files.length > 0) {
+      const urls = files.map((f) => URL.createObjectURL(f));
+      setVideoUrls(urls);
+
+      const video = document.createElement("video");
+      video.src = urls[currentFileIndex];
+      video.onloadedmetadata = () => {
+        setDuration(video.duration);
+        setEndTime(video.duration);
+        setTimingSettings((prev) => ({
+          ...prev,
+          endTime: prev.endTime > 0 ? prev.endTime : video.duration,
+          targetDuration: prev.targetDuration || 10,
+        }));
+      };
+
+      return () => {
+        urls.forEach((url) => URL.revokeObjectURL(url));
+        setVideoUrls([]);
+      };
+    }
+  }, [files, currentFileIndex]);
+
+  const extractAudio = async () => {
+    if (files.length === 0) return;
+    const currentFile = files[currentFileIndex];
+    setIsProcessing(true);
+    setPhase("جاري استخراج الصوت (MP3)...");
+    setProgress(10);
+
+    try {
+      const ffmpeg = ffmpegRef.current;
+      if (ffmpeg) {
+        const uint8 = new Uint8Array(await currentFile.arrayBuffer());
+        await ffmpeg.writeFile("input.mp4", uint8);
+
+        // Force encoding as MP3
+        await ffmpeg.exec([
+          "-i",
+          "input.mp4",
+          "-vn",
+          "-acodec",
+          "libmp3lame",
+          "-q:a",
+          "2",
+          "output.mp3",
+        ]);
+
+        const data = await ffmpeg.readFile("output.mp3");
+        const blob = new Blob([data], { type: "audio/mpeg" });
+        downloadBlob(blob, `${currentFile.name.replace(/\.[^/.]+$/, "")}.mp3`);
+
+        setPhase("تم استخراج الصوت كـ MP3 بنجاح!");
+        setProgress(100);
+        return;
+      }
+      throw new Error("FFmpeg not loaded, falling back to Web Audio");
+    } catch (e) {
+      console.warn("WASM FFmpeg failed, falling back to in-browser audio extraction:", e);
+      try {
+        setPhase("جاري استخراج الصوت محلياً عبر Web Audio...");
+        setProgress(40);
+        const { wavBlob } = await extractAudioInBrowser(currentFile);
+        downloadBlob(wavBlob, `${currentFile.name.replace(/\.[^/.]+$/, "")}.wav`);
+        setPhase("تم استخراج الصوت بنجاح (WAV)!");
+        setProgress(100);
+      } catch (err: any) {
+        console.error("Audio extraction failed completely:", err);
+        setPhase("فشل استخراج الصوت");
+      }
+    } finally {
+      setTimeout(() => {
+        setIsProcessing(false);
+        setPhase("");
+        setProgress(0);
+      }, 2000);
+    }
+  };
+
+  const handleConvert = async () => {
+    if (files.length === 0) return;
+    const format = formats.find((f) => f.id === selectedFormat);
+    if (!format) return;
+
+    if (!currentUser) {
+      onLoginRequired();
+      return;
+    }
+
+    const { allowed, reason } = await checkAccess("Video Conversion");
+    if (!allowed) {
+      onSubscriptionRequired();
+      return;
+    }
+
+    setIsProcessing(true);
+    setProgress(0);
+
+    try {
+      if (isMerging && files.length > 1) {
+        await processMerge();
+      } else {
+        // Batch processing
+        for (let i = 0; i < files.length; i++) {
+          setCurrentFileIndex(i);
+          setPhase(`جاري معالجة الملف ${i + 1} من ${files.length}...`);
+          await processSingleFile(files[i], i);
+        }
+      }
+
+      alert("تم التحويل بنجاح!");
+
+      if (currentUser) {
+        logActivity(
+          currentUser,
+          "convert_video",
+          `Converted ${files.length} videos to ${selectedFormat}`,
+        );
+      }
+
+      onCancel();
+    } catch (e) {
+      console.error(e);
+      alert("حدث خطأ أثناء التحويل: " + (e as any).message);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const processSingleFile = async (currentFile: File, index: number) => {
+    const video = document.createElement("video");
+    const objectUrl = URL.createObjectURL(currentFile);
+    video.src = objectUrl;
+    video.muted = true;
+    video.playsInline = true;
+
+    try {
+      await new Promise((resolve, reject) => {
+        video.onloadedmetadata = () => resolve(null);
+        video.onerror = () => reject(new Error("فشل في تحميل بيانات الفيديو"));
+        setTimeout(
+          () => reject(new Error("انتهت مهلة تحميل بيانات الفيديو")),
+          10000,
+        );
+      });
+
+      await video.play();
+      video.pause();
+
+      const parsedWidth =
+        typeof customWidth === "number"
+          ? customWidth
+          : parseInt(customWidth as string);
+      const parsedHeight =
+        typeof customHeight === "number"
+          ? customHeight
+          : parseInt(customHeight as string);
+      const validScale = isNaN(exportScale) ? 1.0 : exportScale;
+
+      const baseVideoWidth = isVapInput
+        ? Math.floor(video.videoWidth / 2)
+        : video.videoWidth;
+
+      let rawWidth = baseVideoWidth * validScale;
+      let rawHeight = video.videoHeight * validScale;
+
+      if (
+        customWidth &&
+        !isNaN(parsedWidth) &&
+        parsedWidth > 0 &&
+        customHeight &&
+        !isNaN(parsedHeight) &&
+        parsedHeight > 0
+      ) {
+        rawWidth = parsedWidth;
+        rawHeight = parsedHeight;
+      } else if (customWidth && !isNaN(parsedWidth) && parsedWidth > 0) {
+        rawWidth = parsedWidth;
+        rawHeight = Math.round(
+          (parsedWidth / baseVideoWidth) * video.videoHeight,
+        );
+      } else if (customHeight && !isNaN(parsedHeight) && parsedHeight > 0) {
+        rawHeight = parsedHeight;
+        rawWidth = Math.round(
+          (parsedHeight / video.videoHeight) * baseVideoWidth,
+        );
+      }
+
+      const isVap =
+        selectedFormat === "VAP (MP4)" || selectedFormat === "VAP 1.0.5";
+      const maxPixels = isVap ? 6000000 : 9437184; // Cap VAP earlier because it expands dimensions
+      const safe = calculateSafeDimensions(rawWidth, rawHeight, maxPixels);
+      let vw = safe.width;
+      let vh = safe.height;
+
+      const effectiveOutputDuration = calculateOutputDuration(video.duration, timingSettings);
+      const validFps = isNaN(fps) || fps <= 0 ? 30 : fps;
+      const totalFrames = Math.max(1, Math.floor(effectiveOutputDuration * validFps));
+
+      const firstFrameTime = getTimeForFrame(0, totalFrames, video.duration, timingSettings);
+      video.currentTime = firstFrameTime;
+      await new Promise((r) => {
+        const onSeek = () => {
+          video.removeEventListener("seeked", onSeek);
+          r(null);
+        };
+        video.addEventListener("seeked", onSeek);
+      });
+
+      let audioData: Uint8Array | null = null;
+      if (audioFile) {
+        const arrayBuffer = await audioFile.arrayBuffer();
+        audioData = new Uint8Array(arrayBuffer);
+      } else if (currentFile) {
+        // Automatically preserve audio from video with synchronized speed scaling
+        try {
+          const effectiveDuration = effectiveOutputDuration;
+          const origDur = video.duration || 1;
+          const speedFactor = origDur / Math.max(0.01, effectiveDuration);
+          const scaledAudio = await extractAndScaleVideoAudio(
+            currentFile,
+            effectiveDuration,
+            speedFactor,
+            selectedFormat === "SVGA 2.0" ? "mp3" : "wav"
+          );
+          if (scaledAudio && scaledAudio.audioBytes && scaledAudio.audioBytes.length > 0) {
+            audioData = scaledAudio.audioBytes;
+            console.log(
+              `[VideoConverter] Extracted & synchronized video audio track: ${audioData.length} bytes, speedFactor: ${speedFactor.toFixed(2)}x`
+            );
+          }
+        } catch (audioErr) {
+          console.warn("[VideoConverter] Native audio extraction skipped:", audioErr);
+        }
+      }
+
+      if (selectedFormat === "SVGA → YYEVA") {
+        await exportToVAP(
+          video,
+          vw,
+          vh,
+          totalFrames,
+          fps,
+          audioData,
+          video.duration,
+          timingSettings,
+          currentFile.name,
+          true,
+        );
+      } else if (selectedFormat === "VAP (MP4)") {
+        await exportToVAP(
+          video,
+          vw,
+          vh,
+          totalFrames,
+          fps,
+          audioData,
+          video.duration,
+          timingSettings,
+          currentFile.name,
+          false,
+        );
+      } else if (selectedFormat === "VAP 1.0.5") {
+        await exportToVAP105(
+          video,
+          vw,
+          vh,
+          totalFrames,
+          fps,
+          audioData,
+          video.duration,
+          timingSettings,
+          currentFile.name,
+        );
+      } else if (selectedFormat === "SVGA 2.0") {
+        await exportToSVGA(
+          video,
+          vw,
+          vh,
+          totalFrames,
+          fps,
+          audioData,
+          video.duration,
+          timingSettings,
+          currentFile.name,
+        );
+      } else if (selectedFormat === "GIF (Animation)") {
+        await exportToGIF(
+          video,
+          vw,
+          vh,
+          totalFrames,
+          fps,
+          video.duration,
+          timingSettings,
+          currentFile.name,
+        );
+      } else if (selectedFormat === "APNG (Animation)") {
+        await exportToAPNG(
+          video,
+          vw,
+          vh,
+          totalFrames,
+          fps,
+          video.duration,
+          timingSettings,
+          currentFile.name,
+        );
+      } else if (selectedFormat === "WebP (Animated)") {
+        await exportToWebP(
+          video,
+          vw,
+          vh,
+          totalFrames,
+          fps,
+          video.duration,
+          timingSettings,
+          currentFile.name,
+        );
+      } else if (selectedFormat === "WebM (Video)") {
+        await exportToWebM(
+          video,
+          vw,
+          vh,
+          totalFrames,
+          fps,
+          video.duration,
+          timingSettings,
+          currentFile.name,
+        );
+      }
+    } finally {
+      URL.revokeObjectURL(objectUrl);
+      video.src = "";
+      video.load();
+    }
+  };
+
+  const processMerge = async () => {
+    setPhase("جاري دمج الفيديوهات...");
+    // For merging, we'll use the first video's dimensions as base
+    const firstVideo = document.createElement("video");
+    const firstObjectUrl = URL.createObjectURL(files[0]);
+    firstVideo.src = firstObjectUrl;
+    await new Promise((r) => (firstVideo.onloadedmetadata = () => r(null)));
+
+    const parsedWidth =
+      typeof customWidth === "number"
+        ? customWidth
+        : parseInt(customWidth as string);
+    const parsedHeight =
+      typeof customHeight === "number"
+        ? customHeight
+        : parseInt(customHeight as string);
+    const validScale = isNaN(exportScale) ? 1.0 : exportScale;
+
+    const baseVideoWidth = isVapInput
+      ? Math.floor(firstVideo.videoWidth / 2)
+      : firstVideo.videoWidth;
+    let rawWidth = baseVideoWidth * validScale;
+    let rawHeight = firstVideo.videoHeight * validScale;
+
+    if (
+      customWidth &&
+      !isNaN(parsedWidth) &&
+      parsedWidth > 0 &&
+      customHeight &&
+      !isNaN(parsedHeight) &&
+      parsedHeight > 0
+    ) {
+      rawWidth = parsedWidth;
+      rawHeight = parsedHeight;
+    } else if (customWidth && !isNaN(parsedWidth) && parsedWidth > 0) {
+      rawWidth = parsedWidth;
+      rawHeight = Math.round(
+        (parsedWidth / baseVideoWidth) * firstVideo.videoHeight,
+      );
+    } else if (customHeight && !isNaN(parsedHeight) && parsedHeight > 0) {
+      rawHeight = parsedHeight;
+      rawWidth = Math.round(
+        (parsedHeight / firstVideo.videoHeight) * baseVideoWidth,
+      );
+    }
+
+    const safe = calculateSafeDimensions(rawWidth, rawHeight);
+    let vw = safe.width;
+    let vh = safe.height;
+
+    URL.revokeObjectURL(firstObjectUrl);
+    firstVideo.src = "";
+    firstVideo.load();
+
+    const safeWidth = vw;
+    const safeHeight = vh;
+    const validFps = isNaN(fps) || fps <= 0 ? 30 : fps;
+
+    const muxer = new Mp4Muxer.Muxer({
+      target: new Mp4Muxer.ArrayBufferTarget(),
+      video: {
+        codec: "avc",
+        width: safeWidth,
+        height: safeHeight,
+      },
+      fastStart: "in-memory",
+    });
+
+    let hasEncoderError = false;
+    const videoEncoder = new VideoEncoder({
+      output: (chunk: any, meta: any) => muxer.addVideoChunk(chunk, meta),
+      error: (e: any) => {
+        console.error("VideoEncoder error:", e);
+        hasEncoderError = true;
+      },
+    });
+
+    const videoCodec =
+      safeWidth * safeHeight > 2228224 ? "avc1.4d0033" : "avc1.4d002a";
+    let bitrate = customBitrate ? Number(customBitrate) * 1000000 : 8000000;
+
+    videoEncoder.configure({
+      codec: videoCodec,
+      width: safeWidth,
+      height: safeHeight,
+      bitrate: bitrate,
+      framerate: validFps,
+    });
+
+    const canvas = document.createElement("canvas");
+    canvas.width = safeWidth;
+    canvas.height = safeHeight;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+    let globalFrameCount = 0;
+
+    const video = document.createElement("video");
+    video.muted = true;
+    video.playsInline = true;
+
+    try {
+      for (let i = 0; i < files.length; i++) {
+        setCurrentFileIndex(i);
+        const currentFile = files[i];
+        const objectUrl = URL.createObjectURL(currentFile);
+        video.src = objectUrl;
+
+        await new Promise((resolve, reject) => {
+          video.onloadedmetadata = () => resolve(null);
+          video.onerror = () =>
+            reject(new Error(`فشل في تحميل الفيديو: ${currentFile.name}`));
+          setTimeout(
+            () =>
+              reject(
+                new Error(`انتهت مهلة تحميل الفيديو: ${currentFile.name}`),
+              ),
+            10000,
+          );
+        });
+
+        const fileDuration = video.duration;
+        const fileFrames = Math.floor(fileDuration * validFps);
+
+        for (let f = 0; f < fileFrames; f++) {
+          video.currentTime = f / validFps;
+          await new Promise((r) => {
+            const onSeek = () => {
+              video.removeEventListener("seeked", onSeek);
+              r(null);
+            };
+            video.addEventListener("seeked", onSeek);
+          });
+
+          if (ctx) {
+            if (hasEncoderError) break;
+            ctx.clearRect(0, 0, safeWidth, safeHeight);
+            drawVideoCentered(ctx, video, safeWidth, safeHeight);
+            applyTransparencyEffects(ctx, safeWidth, safeHeight);
+
+            const bitmap = await createImageBitmap(canvas);
+            const frame = new VideoFrame(bitmap, {
+              timestamp: (globalFrameCount * 1000000) / validFps,
+            });
+            videoEncoder.encode(frame, {
+              keyFrame: globalFrameCount % 30 === 0,
+            });
+            frame.close();
+            bitmap.close();
+          }
+          globalFrameCount++;
+          setProgress(
+            Math.floor(
+              ((i * fileFrames + f) / (files.length * fileFrames)) * 100,
+            ),
+          );
+        }
+        URL.revokeObjectURL(objectUrl);
+        video.src = "";
+        video.load();
+      }
+    } finally {
+      video.src = "";
+      video.load();
+    }
+
+    if (hasEncoderError)
+      throw new Error("Video encoding failed. Check console for details.");
+    await videoEncoder.flush();
+    videoEncoder.close();
+    muxer.finalize();
+    const buffer = muxer.target.buffer;
+    downloadBlob(
+      new Blob([buffer], { type: "video/mp4" }),
+      `Merged_Video_${Date.now()}.mp4`,
+    );
+
+    if (generateChecksum) {
+      const checksum = await calculateChecksum(buffer);
+      downloadBlob(
+        new Blob([checksum], { type: "text/plain" }),
+        `Merged_Video_${Date.now()}.sha256`,
+      );
+    }
+  };
+
+  const exportToMP4Standard = async (
+    video: HTMLVideoElement,
+    vw: number,
+    vh: number,
+    totalFrames: number,
+    fps: number,
+    audioData: Uint8Array | null,
+    videoDuration: number,
+    timingSettings: TimingSettings,
+    fileName?: string,
+  ) => {
+    setPhase("جاري إنشاء فيديو MP4 القياسي...");
+
+    // Ensure valid dimensions and even integers for MP4
+    vw = Math.round(vw);
+    vh = Math.round(vh);
+    if (isNaN(vw) || vw <= 0) vw = 1334;
+    if (isNaN(vh) || vh <= 0) vh = 750;
+
+    const safeWidth = Math.floor(vw / 2) * 2;
+    const safeHeight = Math.floor(vh / 2) * 2;
+
+    console.log(
+      `MP4 Export Dimensions: vw=${vw}, vh=${vh}, safeWidth=${safeWidth}, safeHeight=${safeHeight}`,
+    );
+
+    if (
+      isNaN(safeWidth) ||
+      safeWidth <= 0 ||
+      isNaN(safeHeight) ||
+      safeHeight <= 0
+    ) {
+      throw new Error(`أبعاد الفيديو غير صالحة: ${safeWidth}x${safeHeight}`);
+    }
+
+    // Audio Setup (AAC for MP4)
+    let audioTrack: any = undefined;
+    let audioEncoder: AudioEncoder | null = null;
+    let audioDataChunks: AudioData[] = [];
+
+    if (audioData) {
+      try {
+        const offlineCtx = new OfflineAudioContext(2, 48000 * 1, 48000);
+        const audioBuffer = await offlineCtx.decodeAudioData(
+          audioData.buffer.slice(0),
+        );
+
+        audioTrack = {
+          codec: "mp4a.40.2",
+          numberOfChannels: 2,
+          sampleRate: 48000,
+        };
+
+        const numberOfChannels = 2;
+        const sampleRate = audioBuffer.sampleRate;
+        const duration = totalFrames / fps;
+        const maxSamples = Math.floor(duration * sampleRate);
+        const length = Math.min(audioBuffer.length, maxSamples);
+        const planarBuffer = new Float32Array(length * numberOfChannels);
+
+        for (let c = 0; c < numberOfChannels; c++) {
+          const channelData =
+            audioBuffer.numberOfChannels > c
+              ? audioBuffer.getChannelData(c)
+              : audioBuffer.getChannelData(0);
+          planarBuffer.set(channelData.subarray(0, length), c * length);
+        }
+
+        const chunkSize = sampleRate;
+        for (let i = 0; i < length; i += chunkSize) {
+          const currentChunkSize = Math.min(chunkSize, length - i);
+          const chunkBuffer = new Float32Array(
+            currentChunkSize * numberOfChannels,
+          );
+          for (let c = 0; c < numberOfChannels; c++) {
+            const start = c * length + i;
+            const end = start + currentChunkSize;
+            chunkBuffer.set(
+              planarBuffer.subarray(start, end),
+              c * currentChunkSize,
+            );
+          }
+          audioDataChunks.push(
+            new AudioData({
+              format: "f32-planar",
+              sampleRate: sampleRate,
+              numberOfFrames: currentChunkSize,
+              numberOfChannels: numberOfChannels,
+              timestamp: (i / sampleRate) * 1000000,
+              data: chunkBuffer,
+            }),
+          );
+        }
+      } catch (audioError) {
+        console.warn(
+          "Audio processing failed, continuing without audio:",
+          audioError,
+        );
+        audioTrack = undefined;
+        audioDataChunks = [];
+      }
+    }
+
+    const muxer = new Mp4Muxer.Muxer({
+      target: new Mp4Muxer.ArrayBufferTarget(),
+      video: {
+        codec: "avc",
+        width: safeWidth,
+        height: safeHeight,
+      },
+      audio: audioTrack
+        ? {
+            codec: "aac",
+            numberOfChannels: 2,
+            sampleRate: 48000,
+          }
+        : undefined,
+      fastStart: "in-memory",
+    });
+
+    let hasEncoderError = false;
+    const videoEncoder = new VideoEncoder({
+      output: (chunk: any, meta: any) => muxer.addVideoChunk(chunk, meta),
+      error: (e: any) => {
+        console.error("VideoEncoder error:", e);
+        hasEncoderError = true;
+      },
+    });
+
+    const videoCodec =
+      safeWidth * safeHeight > 2228224 ? "avc1.4d0033" : "avc1.4d002a";
+
+    let bitrate = customBitrate ? Number(customBitrate) * 1000000 : 8000000;
+    if (!customBitrate) {
+      if (globalQuality === "high") bitrate = 15000000;
+      if (globalQuality === "low") bitrate = 4000000;
+    }
+
+    if (audioTrack) {
+      audioEncoder = new AudioEncoder({
+        output: (chunk: any, meta: any) => muxer.addAudioChunk(chunk, meta),
+        error: (e: any) => console.error(e),
+      });
+      audioEncoder.configure({
+        codec: "mp4a.40.2",
+        numberOfChannels: 2,
+        sampleRate: 48000,
+        bitrate: 128000,
+      });
+      for (const chunk of audioDataChunks) {
+        audioEncoder.encode(chunk);
+        chunk.close();
+      }
+      await audioEncoder.flush();
+    }
+
+    // Configure video encoder right before the loop to avoid inactivity reclamation
+    videoEncoder.configure({
+      codec: videoCodec,
+      width: safeWidth,
+      height: safeHeight,
+      bitrate: bitrate,
+    });
+
+    const canvas = document.createElement("canvas");
+    canvas.width = safeWidth;
+    canvas.height = safeHeight;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+    const tempCanvas = document.createElement("canvas");
+    tempCanvas.width = isVapInput ? safeWidth * 2 : safeWidth;
+    tempCanvas.height = safeHeight;
+    const tCtx = tempCanvas.getContext("2d", { willReadFrequently: true });
+
+    for (let i = 0; i < totalFrames; i++) {
+      if (ctx && tCtx) {
+        if (hasEncoderError) break;
+        const currentFrameTime = getTimeForFrame(i, totalFrames, videoDuration, timingSettings);
+        await captureFrame(
+          video,
+          ctx,
+          tCtx,
+          safeWidth,
+          safeHeight,
+          currentFrameTime,
+        );
+
+        const bitmap = await createImageBitmap(canvas);
+        const frame = new VideoFrame(bitmap, {
+          timestamp: (i * 1000000) / fps,
+        });
+
+        while (videoEncoder.encodeQueueSize > 10 && !hasEncoderError) {
+          await new Promise((r) => requestAnimationFrame(r));
+        }
+
+        if (hasEncoderError) {
+          frame.close();
+          bitmap.close();
+          break;
+        }
+
+        videoEncoder.encode(frame, { keyFrame: i % 30 === 0 });
+        frame.close();
+        bitmap.close();
+      }
+
+      if (i % 5 === 0) {
+        await new Promise((r) => requestAnimationFrame(r));
+        setProgress(Math.floor((i / totalFrames) * 100));
+      }
+    }
+
+    if (hasEncoderError)
+      throw new Error("Video encoding failed. Check console for details.");
+    await videoEncoder.flush();
+    videoEncoder.close();
+    if (audioEncoder) {
+      await audioEncoder.flush();
+      audioEncoder.close();
+    }
+    muxer.finalize();
+    const buffer = muxer.target.buffer;
+    downloadBlob(
+      new Blob([buffer], { type: "video/mp4" }),
+      `${fileName?.replace(".mp4", "") || "Video"}_Standard.mp4`,
+    );
+
+    if (generateChecksum) {
+      const checksum = await calculateChecksum(buffer);
+      downloadBlob(
+        new Blob([checksum], { type: "text/plain" }),
+        `${fileName?.replace(".mp4", "") || "Video"}_Standard.sha256`,
+      );
+    }
+  };
+
+  const exportToVAP105 = async (
+    video: HTMLVideoElement,
+    vw: number,
+    vh: number,
+    totalFrames: number,
+    fps: number,
+    audioData: Uint8Array | null,
+    videoDuration: number,
+    timingSettings: TimingSettings,
+    fileName?: string,
+  ) => {
+    setPhase("جاري تحضير VAP 1.0.5...");
+
+    // Ensure valid dimensions
+    vw = Math.round(vw);
+    vh = Math.round(vh);
+    if (isNaN(vw) || vw <= 0) vw = 1334;
+    if (isNaN(vh) || vh <= 0) vh = 750;
+
+    // VAP Layout Calculation
+    const width = vw;
+    const height = vh;
+    const gap = 4;
+    const alphaWidth = Math.floor(width / 2);
+    const alphaHeight = Math.floor(height / 2);
+
+    // Align to 16px
+    const videoW = Math.ceil((width + gap + alphaWidth) / 16) * 16;
+    const videoH = Math.ceil(height / 16) * 16;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = videoW;
+    canvas.height = videoH;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+    if (!ctx) throw new Error("Canvas context not supported");
+
+    // Audio Setup
+    let audioEncoder: AudioEncoder | null = null;
+    let audioTrack: any = undefined;
+    let audioDataChunks: AudioData[] = [];
+
+    if (audioData) {
+      try {
+        const offlineCtx = new OfflineAudioContext(2, 48000 * 1, 48000);
+        const audioBuffer = await offlineCtx.decodeAudioData(
+          audioData.buffer.slice(0),
+        );
+
+        audioTrack = {
+          codec: "mp4a.40.2",
+          numberOfChannels: 2,
+          sampleRate: 48000,
+        };
+
+        const numberOfChannels = 2;
+        const sampleRate = audioBuffer.sampleRate;
+        const duration = totalFrames / fps;
+        const maxSamples = Math.floor(duration * sampleRate);
+        const length = Math.min(audioBuffer.length, maxSamples);
+        const planarBuffer = new Float32Array(length * numberOfChannels);
+
+        for (let c = 0; c < numberOfChannels; c++) {
+          const channelData =
+            audioBuffer.numberOfChannels > c
+              ? audioBuffer.getChannelData(c)
+              : audioBuffer.getChannelData(0);
+          planarBuffer.set(channelData.subarray(0, length), c * length);
+        }
+
+        const chunkSize = sampleRate;
+        for (let i = 0; i < length; i += chunkSize) {
+          const currentChunkSize = Math.min(chunkSize, length - i);
+          const chunkBuffer = new Float32Array(
+            currentChunkSize * numberOfChannels,
+          );
+          for (let c = 0; c < numberOfChannels; c++) {
+            const start = c * length + i;
+            const end = start + currentChunkSize;
+            chunkBuffer.set(
+              planarBuffer.subarray(start, end),
+              c * currentChunkSize,
+            );
+          }
+          audioDataChunks.push(
+            new AudioData({
+              format: "f32-planar",
+              sampleRate: sampleRate,
+              numberOfFrames: currentChunkSize,
+              numberOfChannels: numberOfChannels,
+              timestamp: (i / sampleRate) * 1000000,
+              data: chunkBuffer,
+            }),
+          );
+        }
+      } catch (audioError) {
+        console.warn(
+          "Audio processing failed, continuing without audio:",
+          audioError,
+        );
+        audioTrack = undefined;
+        audioDataChunks = [];
+      }
+    }
+
+    // Mp4Muxer Setup
+    const muxer = new Mp4Muxer.Muxer({
+      target: new Mp4Muxer.ArrayBufferTarget(),
+      video: {
+        codec: "avc",
+        width: videoW,
+        height: videoH,
+      },
+      audio: audioTrack
+        ? {
+            codec: "aac",
+            numberOfChannels: 2,
+            sampleRate: 48000,
+          }
+        : undefined,
+      fastStart: "in-memory",
+    });
+
+    let hasEncoderError = false;
+    const videoEncoder = new VideoEncoder({
+      output: (chunk: any, meta: any) => muxer.addVideoChunk(chunk, meta),
+      error: (e: any) => {
+        console.error("VideoEncoder error:", e);
+        hasEncoderError = true;
+      },
+    });
+
+    if (audioTrack && audioDataChunks.length > 0) {
+      audioEncoder = new AudioEncoder({
+        output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+        error: (e) => console.error("AudioEncoder error:", e),
+      });
+
+      audioEncoder.configure({
+        codec: "mp4a.40.2",
+        numberOfChannels: 2,
+        sampleRate: 48000,
+        bitrate: 128000,
+      });
+
+      for (const chunk of audioDataChunks) {
+        audioEncoder.encode(chunk);
+        chunk.close();
+      }
+      await audioEncoder.flush();
+    }
+
+    const totalPixels = videoW * videoH;
+    const codec = totalPixels > 2228224 ? "avc1.4d0033" : "avc1.4d002a";
+
+    // Calculate bitrate based on globalQuality and user-defined compressionRatio
+    let baseBitrate = 8000000;
+    if (globalQuality === "low") baseBitrate = 2000000;
+    if (globalQuality === "medium") baseBitrate = 5000000;
+    if (globalQuality === "high") baseBitrate = 12000000;
+
+    let bitrate = customBitrate
+      ? Number(customBitrate) * 1000000
+      : Math.round(baseBitrate * (compressionRatio / 100));
+    bitrate = Math.max(bitrate, 1000000); // Minimum safe bitrate
+
+    videoEncoder.configure({
+      codec: codec,
+      width: videoW,
+      height: videoH,
+      bitrate: bitrate,
+      framerate: fps,
+    });
+
+    const frameDuration = 1000000 / fps; // Microseconds
+
+    // Temp canvas for processing source frame
+    const tempCanvas = document.createElement("canvas");
+    tempCanvas.width = width;
+    tempCanvas.height = height;
+    const tCtx = tempCanvas.getContext("2d", { willReadFrequently: true });
+
+    for (let i = 0; i < totalFrames; i++) {
+      setPhase(`جاري معالجة الإطار ${i + 1}/${totalFrames}`);
+
+      video.currentTime = getTimeForFrame(i, totalFrames, videoDuration, timingSettings);
+      await new Promise((r) => {
+        const onSeek = () => {
+          video.removeEventListener("seeked", onSeek);
+          r(null);
+        };
+        video.addEventListener("seeked", onSeek);
+      });
+
+      if (ctx && tCtx) {
+        ctx.fillStyle = "#000000";
+        ctx.fillRect(0, 0, videoW, videoH);
+
+        // 1. Draw Source Frame
+        tCtx.clearRect(0, 0, width, height);
+        drawVideoCentered(tCtx, video, width, height);
+
+        // Apply transparency effects
+        applyTransparencyEffects(tCtx, width, height);
+
+        // 2. Draw RGB to main canvas (Left)
+        ctx.drawImage(tempCanvas, 0, 0);
+
+        // 3. Extract Alpha and Draw (Right)
+        const frameData = tCtx.getImageData(0, 0, width, height);
+        const alphaCanvas = document.createElement("canvas");
+        alphaCanvas.width = width;
+        alphaCanvas.height = height;
+        const aCtx = alphaCanvas.getContext("2d");
+
+        if (aCtx) {
+          const alphaImageData = aCtx.createImageData(width, height);
+          const d = frameData.data;
+          const ad = alphaImageData.data;
+          for (let p = 0; p < d.length; p += 4) {
+            const a = d[p + 3];
+            ad[p] = a; // R
+            ad[p + 1] = a; // G
+            ad[p + 2] = a; // B
+            ad[p + 3] = 255; // Alpha
+          }
+          aCtx.putImageData(alphaImageData, 0, 0);
+
+          // Draw scaled alpha to main canvas
+          ctx.drawImage(alphaCanvas, width + gap, 0, alphaWidth, alphaHeight);
+        }
+      }
+
+      // Create VideoFrame
+      if (hasEncoderError) throw new Error("Video encoding failed");
+      const videoFrame = new VideoFrame(canvas, {
+        timestamp: i * frameDuration,
+      });
+
+      while (videoEncoder.encodeQueueSize > 10) {
+        await new Promise((r) => requestAnimationFrame(r));
+      }
+
+      videoEncoder.encode(videoFrame, { keyFrame: i % 30 === 0 });
+      videoFrame.close();
+
+      // Yield to UI
+      if (i % 5 === 0) {
+        await new Promise((r) => requestAnimationFrame(r));
+        setProgress(Math.floor((i / totalFrames) * 100));
+      }
+    }
+
+    await videoEncoder.flush();
+    videoEncoder.close();
+    if (audioEncoder) {
+      await audioEncoder.flush();
+      audioEncoder.close();
+    }
+    muxer.finalize();
+
+    // Generate JSON Config
+    const jsonConfig = {
+      info: {
+        v: 2,
+        f: totalFrames,
+        w: width,
+        h: height,
+        fps: fps,
+        videoW: videoW,
+        videoH: videoH,
+        aFrame: [width + gap, 0, alphaWidth, alphaHeight],
+        rgbFrame: [0, 0, width, height],
+        isVapx: 0,
+        codeTag: ["common"],
+        orien: 0,
+      },
+    };
+
+    const jsonStr = JSON.stringify(jsonConfig);
+
+    // Create vapc box
+    const jsonBytes = new TextEncoder().encode(jsonStr);
+    const boxSize = 8 + jsonBytes.length;
+    const boxBuffer = new Uint8Array(boxSize);
+    const view = new DataView(boxBuffer.buffer);
+
+    view.setUint32(0, boxSize);
+    view.setUint8(4, 0x76); // v
+    view.setUint8(5, 0x61); // a
+    view.setUint8(6, 0x70); // p
+    view.setUint8(7, 0x63); // c
+
+    boxBuffer.set(jsonBytes, 8);
+
+    // Combine buffers (Append vapc box to the end of the file)
+    const muxerBuffer = muxer.target.buffer;
+    const finalBuffer = new Uint8Array(muxerBuffer.byteLength + boxSize);
+    finalBuffer.set(new Uint8Array(muxerBuffer), 0);
+    finalBuffer.set(boxBuffer, muxerBuffer.byteLength);
+
+    const buffer = finalBuffer.buffer;
+    const checksum = await calculateChecksum(buffer);
+
+    // Download Files
+    const baseName =
+      fileName?.replace(".mp4", "") || `vap_export_${new Date().getTime()}`;
+
+    // 1. Video (with embedded vapc)
+    const videoBlob = new Blob([buffer], { type: "video/mp4" });
+    downloadBlob(videoBlob, `${baseName}.mp4`);
+
+    // 3. Checksum (SHA-256)
+    const checksumBlob = new Blob([checksum], { type: "text/plain" });
+    downloadBlob(checksumBlob, `${baseName}.sha256`);
+
+    alert("تم تصدير ملفات VAP 1.0.5 بنجاح!");
+  };
+
+  const exportToWebM = async (
+    video: HTMLVideoElement,
+    vw: number,
+    vh: number,
+    totalFrames: number,
+    fps: number,
+    videoDuration: number,
+    timingSettings: TimingSettings,
+    fileName?: string,
+  ) => {
+    setPhase("جاري إنشاء WebM الشفاف...");
+
+    // Ensure valid dimensions
+    vw = Math.round(vw);
+    vh = Math.round(vh);
+    if (isNaN(vw) || vw <= 0) vw = 1334;
+    if (isNaN(vh) || vh <= 0) vh = 750;
+
+    const muxer = new WebMMuxer.Muxer({
+      target: new WebMMuxer.ArrayBufferTarget(),
+      video: {
+        codec: "V_VP9",
+        width: vw,
+        height: vh,
+        frameRate: fps,
+        alpha: true,
+      },
+    });
+
+    let hasEncoderError = false;
+    const videoEncoder = new VideoEncoder({
+      output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+      error: (e) => {
+        console.error("VideoEncoder error:", e);
+        hasEncoderError = true;
+      },
+    });
+
+    videoEncoder.configure({
+      codec: "vp09.00.10.08",
+      width: vw,
+      height: vh,
+      bitrate: customBitrate
+        ? Number(customBitrate) * 1000000
+        : globalQuality === "high"
+          ? 8000000
+          : globalQuality === "medium"
+            ? 4000000
+            : 1500000,
+      alpha: "keep",
+    });
+
+    const canvas = document.createElement("canvas");
+    canvas.width = vw;
+    canvas.height = vh;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+    const tempCanvas = document.createElement("canvas");
+    tempCanvas.width = isVapInput ? vw * 2 : vw;
+    tempCanvas.height = vh;
+    const tCtx = tempCanvas.getContext("2d", { willReadFrequently: true });
+
+    for (let i = 0; i < totalFrames; i++) {
+      if (ctx && tCtx) {
+        if (hasEncoderError) break;
+        const currentFrameTime = getTimeForFrame(i, totalFrames, videoDuration, timingSettings);
+        await captureFrame(video, ctx, tCtx, vw, vh, currentFrameTime);
+
+        const bitmap = await createImageBitmap(canvas);
+        const frame = new VideoFrame(bitmap, {
+          timestamp: (i * 1000000) / fps,
+        });
+
+        while (videoEncoder.encodeQueueSize > 10 && !hasEncoderError) {
+          await new Promise((r) => requestAnimationFrame(r));
+        }
+
+        if (hasEncoderError) {
+          frame.close();
+          bitmap.close();
+          break;
+        }
+
+        videoEncoder.encode(frame, { keyFrame: i % 30 === 0 });
+        frame.close();
+        bitmap.close();
+      }
+
+      if (i % 5 === 0) {
+        await new Promise((r) => requestAnimationFrame(r));
+        setProgress(Math.floor((i / totalFrames) * 100));
+      }
+    }
+
+    await videoEncoder.flush();
+    videoEncoder.close();
+    muxer.finalize();
+    downloadBlob(
+      new Blob([muxer.target.buffer], { type: "video/webm" }),
+      `${fileName?.replace(".mp4", "") || "Video"}.webm`,
+    );
+  };
+
+  const exportToWebP = async (
+    video: HTMLVideoElement,
+    vw: number,
+    vh: number,
+    totalFrames: number,
+    fps: number,
+    videoDuration: number,
+    timingSettings: TimingSettings,
+    fileName?: string,
+  ) => {
+    setPhase("جاري إنشاء WebP المتحرك...");
+
+    // Ensure valid dimensions
+    if (isNaN(vw) || vw <= 0) vw = 1334;
+    if (isNaN(vh) || vh <= 0) vh = 750;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = vw;
+    canvas.height = vh;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+    const tempCanvas = document.createElement("canvas");
+    tempCanvas.width = isVapInput ? vw * 2 : vw;
+    tempCanvas.height = vh;
+    const tCtx = tempCanvas.getContext("2d", { willReadFrequently: true });
+
+    const frames: { data: Uint8Array; duration: number }[] = [];
+
+    // 1. Capture Frames
+    for (let i = 0; i < totalFrames; i++) {
+      if (ctx && tCtx) {
+        const currentFrameTime = getTimeForFrame(i, totalFrames, videoDuration, timingSettings);
+        await captureFrame(video, ctx, tCtx, vw, vh, currentFrameTime);
+
+        const base64 = canvas.toDataURL(
+          "image/webp",
+          globalQuality === "high"
+            ? 0.9
+            : globalQuality === "medium"
+              ? 0.75
+              : 0.5,
+        );
+        const binary = atob(base64.split(",")[1]);
+        const bytes = new Uint8Array(binary.length);
+        for (let j = 0; j < binary.length; j++) bytes[j] = binary.charCodeAt(j);
+
+        frames.push({ data: bytes, duration: Math.round(1000 / fps) });
+      }
+      setProgress(Math.floor((i / totalFrames) * 80));
+    }
+
+    setPhase("جاري تجميع ملف WebP...");
+
+    // 2. Muxing Logic
+    const chunks: Uint8Array[] = [];
+
+    // VP8X Chunk
+    const vp8x = new Uint8Array(18);
+    vp8x.set([0x56, 0x50, 0x38, 0x58], 0); // 'VP8X'
+    vp8x.set([0x0a, 0x00, 0x00, 0x00], 4); // Size 10
+    // Flags: Animation (bit 1) + Alpha (bit 4) = 0x02 | 0x10 = 0x12
+    vp8x[8] = 0x12;
+    // Canvas Width (24 bit)
+    vp8x[12] = (vw - 1) & 0xff;
+    vp8x[13] = ((vw - 1) >> 8) & 0xff;
+    vp8x[14] = ((vw - 1) >> 16) & 0xff;
+    // Canvas Height (24 bit)
+    vp8x[15] = (vh - 1) & 0xff;
+    vp8x[16] = ((vh - 1) >> 8) & 0xff;
+    vp8x[17] = ((vh - 1) >> 16) & 0xff;
+    chunks.push(vp8x);
+
+    // ANIM Chunk
+    const anim = new Uint8Array(14);
+    anim.set([0x41, 0x4e, 0x49, 0x4d], 0); // 'ANIM'
+    anim.set([0x06, 0x00, 0x00, 0x00], 4); // Size 6
+    // BG Color (Blue, Green, Red, Alpha) -> 0,0,0,0
+    anim.set([0, 0, 0, 0], 8);
+    // Loop Count (0 = infinite)
+    anim.set([0, 0], 12);
+    chunks.push(anim);
+
+    // ANMF Chunks
+    for (const frame of frames) {
+      // Parse single frame WebP to get VP8/VP8L/ALPH chunks
+      let offset = 12; // Skip RIFF header
+      const frameData = frame.data;
+      const frameChunks: Uint8Array[] = [];
+
+      while (offset < frameData.length) {
+        const fourCC = String.fromCharCode(
+          ...frameData.slice(offset, offset + 4),
+        );
+        const size =
+          frameData[offset + 4] |
+          (frameData[offset + 5] << 8) |
+          (frameData[offset + 6] << 16) |
+          (frameData[offset + 7] << 24);
+
+        if (fourCC === "VP8 " || fourCC === "VP8L" || fourCC === "ALPH") {
+          const chunkHeader = frameData.slice(offset, offset + 8);
+          const chunkPayload = frameData.slice(offset + 8, offset + 8 + size);
+          const padding =
+            size % 2 !== 0 ? new Uint8Array([0]) : new Uint8Array(0);
+
+          const fullChunk = new Uint8Array(
+            chunkHeader.length + chunkPayload.length + padding.length,
+          );
+          fullChunk.set(chunkHeader);
+          fullChunk.set(chunkPayload, 8);
+          if (padding.length > 0) fullChunk.set(padding, 8 + size);
+
+          frameChunks.push(fullChunk);
+        }
+        offset += 8 + size + (size % 2);
+      }
+
+      // Create ANMF Header
+      let payloadSize = 0;
+      frameChunks.forEach((c) => (payloadSize += c.length));
+      const anmfSize = 16 + payloadSize;
+
+      const anmf = new Uint8Array(8 + 16); // Header + Frame Data Header
+      anmf.set([0x41, 0x4e, 0x4d, 0x46], 0); // 'ANMF'
+      anmf.set(
+        [
+          anmfSize & 0xff,
+          (anmfSize >> 8) & 0xff,
+          (anmfSize >> 16) & 0xff,
+          (anmfSize >> 24) & 0xff,
+        ],
+        4,
+      );
+
+      // Frame X, Y, W, H, Duration, Flags
+      // X (3), Y (3), W (3), H (3), Dur (3), Flags (1)
+      anmf[8] = 0;
+      anmf[9] = 0;
+      anmf[10] = 0; // X
+      anmf[11] = 0;
+      anmf[12] = 0;
+      anmf[13] = 0; // Y
+
+      const w = vw - 1;
+      const h = vh - 1;
+      anmf[14] = w & 0xff;
+      anmf[15] = (w >> 8) & 0xff;
+      anmf[16] = (w >> 16) & 0xff;
+      anmf[17] = h & 0xff;
+      anmf[18] = (h >> 8) & 0xff;
+      anmf[19] = (h >> 16) & 0xff;
+
+      const dur = frame.duration;
+      anmf[20] = dur & 0xff;
+      anmf[21] = (dur >> 8) & 0xff;
+      anmf[22] = (dur >> 16) & 0xff;
+
+      // Flags: Reserved(6) + Blending(1) + Disposal(1)
+      // Disposal 1 (Do not dispose), Blending 0 (Blend) -> 00000010 -> 0x02?
+      // Wait, bit 0 is Disposal. Bit 1 is Blending.
+      // Disposal 1 = 1. Blending 0 = 0.
+      // So 00000001 = 0x01.
+      anmf[23] = 0x01;
+
+      chunks.push(anmf);
+      frameChunks.forEach((c) => chunks.push(c));
+    }
+
+    // Final File Construction
+    let totalSize = 4; // 'WEBP'
+    chunks.forEach((c) => (totalSize += c.length));
+
+    const riff = new Uint8Array(8);
+    riff.set([0x52, 0x49, 0x46, 0x46], 0); // 'RIFF'
+    riff.set(
+      [
+        totalSize & 0xff,
+        (totalSize >> 8) & 0xff,
+        (totalSize >> 16) & 0xff,
+        (totalSize >> 24) & 0xff,
+      ],
+      4,
+    );
+
+    const webpHeader = new Uint8Array(4);
+    webpHeader.set([0x57, 0x45, 0x42, 0x50], 0); // 'WEBP'
+
+    const finalBlob = new Blob([riff, webpHeader, ...chunks], {
+      type: "image/webp",
+    });
+    downloadBlob(finalBlob, `${file?.name.replace(".mp4", "")}.webp`);
+    setProgress(100);
+  };
+
+  const exportToVAP = async (
+    video: HTMLVideoElement,
+    vw: number,
+    vh: number,
+    totalFrames: number,
+    fps: number,
+    audioData: Uint8Array | null,
+    videoDuration: number,
+    timingSettings: TimingSettings,
+    fileName?: string,
+    isYYEVA: boolean = false,
+  ) => {
+    setPhase(`جاري إنشاء فيديو ${isYYEVA ? "YYEVA" : "VAP"}...`);
+
+    // Ensure valid dimensions and even integers for MP4
+    vw = Math.round(vw);
+    vh = Math.round(vh);
+    if (isNaN(vw) || vw <= 0) vw = 1334;
+    if (isNaN(vh) || vh <= 0) vh = 750;
+
+    const safeWidth = Math.floor(vw / 2) * 2;
+    const safeHeight = Math.floor(vh / 2) * 2;
+
+    console.log(
+      `VAP Export Dimensions: vw=${vw}, vh=${vh}, safeWidth=${safeWidth}, safeHeight=${safeHeight}`,
+    );
+
+    if (
+      isNaN(safeWidth) ||
+      safeWidth <= 0 ||
+      isNaN(safeHeight) ||
+      safeHeight <= 0
+    ) {
+      throw new Error(`أبعاد الفيديو غير صالحة: ${safeWidth}x${safeHeight}`);
+    }
+
+    const vapCanvas = document.createElement("canvas");
+    vapCanvas.width = safeWidth * 2;
+    vapCanvas.height = safeHeight;
+    const vCtx = vapCanvas.getContext("2d", { willReadFrequently: true });
+    const tempCanvas = document.createElement("canvas");
+    tempCanvas.width = safeWidth;
+    tempCanvas.height = safeHeight;
+    const tCtx = tempCanvas.getContext("2d", { willReadFrequently: true });
+
+    // Audio Setup
+    let audioTrack: any = undefined;
+    let audioEncoder: AudioEncoder | null = null;
+    let audioDataChunks: AudioData[] = [];
+
+    if (audioData) {
+      try {
+        // Use OfflineAudioContext for more stable decoding
+        const offlineCtx = new OfflineAudioContext(2, 48000 * 1, 48000);
+        const audioBuffer = await offlineCtx.decodeAudioData(
+          audioData.buffer.slice(0),
+        ); // Clone buffer to be safe
+
+        audioTrack = {
+          codec: "A_OPUS",
+          numberOfChannels: 2,
+          sampleRate: 48000,
+        };
+
+        const numberOfChannels = 2;
+        const sampleRate = audioBuffer.sampleRate;
+        const duration = totalFrames / fps;
+        const maxSamples = Math.floor(duration * sampleRate);
+        const length = Math.min(audioBuffer.length, maxSamples);
+        const planarBuffer = new Float32Array(length * numberOfChannels);
+
+        for (let c = 0; c < numberOfChannels; c++) {
+          const channelData =
+            audioBuffer.numberOfChannels > c
+              ? audioBuffer.getChannelData(c)
+              : audioBuffer.getChannelData(0);
+          planarBuffer.set(channelData.subarray(0, length), c * length);
+        }
+
+        const chunkSize = sampleRate;
+        for (let i = 0; i < length; i += chunkSize) {
+          const currentChunkSize = Math.min(chunkSize, length - i);
+          const chunkBuffer = new Float32Array(
+            currentChunkSize * numberOfChannels,
+          );
+          for (let c = 0; c < numberOfChannels; c++) {
+            const start = c * length + i;
+            const end = start + currentChunkSize;
+            chunkBuffer.set(
+              planarBuffer.subarray(start, end),
+              c * currentChunkSize,
+            );
+          }
+          audioDataChunks.push(
+            new AudioData({
+              format: "f32-planar",
+              sampleRate: sampleRate,
+              numberOfFrames: currentChunkSize,
+              numberOfChannels: numberOfChannels,
+              timestamp: (i / sampleRate) * 1000000,
+              data: chunkBuffer,
+            }),
+          );
+        }
+      } catch (e) {
+        console.warn("Audio encoding failed, continuing without audio", e);
+        audioTrack = undefined;
+        audioDataChunks = [];
+      }
+    }
+
+    const muxer = new Mp4Muxer.Muxer({
+      target: new Mp4Muxer.ArrayBufferTarget(),
+      video: { codec: "avc", width: vapCanvas.width, height: vapCanvas.height },
+      audio: audioTrack
+        ? {
+            codec: "aac",
+            numberOfChannels: 2,
+            sampleRate: 48000,
+          }
+        : undefined,
+      fastStart: "in-memory",
+    });
+
+    let hasEncoderError = false;
+    const videoEncoder = new VideoEncoder({
+      output: (chunk, meta) => muxer.addVideoChunk(chunk, meta as any),
+      error: (e) => {
+        console.error("VideoEncoder error:", e);
+        hasEncoderError = true;
+      },
+    });
+
+    if (audioTrack && audioDataChunks.length > 0) {
+      audioEncoder = new AudioEncoder({
+        output: (chunk, meta) => muxer.addAudioChunk(chunk, meta as any),
+        error: (e) => console.error("AudioEncoder error:", e),
+      });
+
+      audioEncoder.configure({
+        codec: "mp4a.40.2",
+        numberOfChannels: 2,
+        sampleRate: 48000,
+        bitrate: 128000,
+      });
+
+      for (const chunk of audioDataChunks) {
+        audioEncoder.encode(chunk);
+        chunk.close();
+      }
+      await audioEncoder.flush();
+    }
+
+    // Calculate bitrate based on globalQuality and user-defined compressionRatio
+    let baseBitrate = 8000000;
+    if (globalQuality === "medium") baseBitrate = 4000000;
+    if (globalQuality === "low") baseBitrate = 1500000;
+    if (globalQuality === "high") baseBitrate = 12000000;
+
+    let bitrate = customBitrate
+      ? Number(customBitrate) * 1000000
+      : Math.round(baseBitrate * (compressionRatio / 100));
+    bitrate = Math.max(bitrate, 1000000); // Minimum safe bitrate
+
+    const videoConfig: VideoEncoderConfig = {
+      codec: "avc1.640033", // H.264 High Profile 5.1
+      width: vapCanvas.width,
+      height: vapCanvas.height,
+      bitrate: bitrate,
+      framerate: fps,
+      latencyMode: "quality",
+      avc: { format: "annexb" },
+    };
+
+    const support = await VideoEncoder.isConfigSupported(videoConfig);
+    if (!support.supported) {
+      console.warn(
+        "H.264 High Profile 5.1 not supported, falling back to Main Profile 5.1",
+      );
+      videoConfig.codec = "avc1.4d0033";
+      const support2 = await VideoEncoder.isConfigSupported(videoConfig);
+      if (!support2.supported) {
+        console.warn(
+          "H.264 Main Profile 5.1 not supported, falling back to Main Profile 4.2",
+        );
+        videoConfig.codec = "avc1.4d002a";
+      }
+    }
+
+    videoEncoder.configure(videoConfig);
+
+    for (let i = 0; i < totalFrames; i++) {
+      video.currentTime = getTimeForFrame(i, totalFrames, videoDuration, timingSettings);
+      await new Promise((r) => {
+        const onSeek = () => {
+          video.removeEventListener("seeked", onSeek);
+          r(null);
+        };
+        video.addEventListener("seeked", onSeek);
+      });
+
+      if (vCtx && tCtx) {
+        // Clear temp canvas
+        tCtx.clearRect(0, 0, safeWidth, safeHeight);
+        drawVideoCentered(tCtx, video, safeWidth, safeHeight);
+
+        // Apply transparency effects to the source before splitting
+        applyTransparencyEffects(tCtx, safeWidth, safeHeight);
+
+        // Prepare VAP Frame
+        // IMPORTANT: Fill with black first to ensure no transparency issues
+        vCtx.fillStyle = "#000000";
+        vCtx.fillRect(0, 0, vapCanvas.width, vapCanvas.height);
+
+        // Draw RGB side (Right)
+        vCtx.drawImage(tempCanvas, safeWidth, 0, safeWidth, safeHeight);
+
+        // Create Alpha Mask
+        const imageData = tCtx.getImageData(0, 0, safeWidth, safeHeight);
+        const data = imageData.data;
+        for (let j = 0; j < data.length; j += 4) {
+          const alpha = data[j + 3];
+          data[j] = alpha;
+          data[j + 1] = alpha;
+          data[j + 2] = alpha;
+          data[j + 3] = 255;
+        }
+        tCtx.putImageData(imageData, 0, 0);
+
+        // Draw Alpha side (Left)
+        vCtx.drawImage(tempCanvas, 0, 0, safeWidth, safeHeight);
+      }
+
+      if (hasEncoderError) break;
+      const bitmap = await createImageBitmap(vapCanvas);
+      const frame = new VideoFrame(bitmap, { timestamp: (i * 1000000) / fps });
+      videoEncoder.encode(frame, { keyFrame: i % 30 === 0 });
+      frame.close();
+      bitmap.close();
+
+      setProgress(Math.floor((i / totalFrames) * 100));
+    }
+
+    if (hasEncoderError)
+      throw new Error("Video encoding failed. Check console for details.");
+    await videoEncoder.flush();
+    videoEncoder.close();
+    if (audioEncoder) {
+      await audioEncoder.flush();
+      audioEncoder.close();
+    }
+    muxer.finalize();
+
+    downloadBlob(
+      new Blob([muxer.target.buffer], { type: "video/mp4" }),
+      `${file?.name}_${isYYEVA ? "YYEVA" : "VAP"}.mp4`,
+    );
+  };
+
+  const exportToSVGA = async (
+    video: HTMLVideoElement,
+    vw: number,
+    vh: number,
+    totalFrames: number,
+    fps: number,
+    audioData: Uint8Array | null,
+    videoDuration: number,
+    timingSettings: TimingSettings,
+    fileName?: string,
+  ) => {
+    if (totalFrames <= 0) {
+      alert("مدة الفيديو غير صالحة للتحويل");
+      return;
+    }
+
+    // Ensure valid dimensions
+    if (isNaN(vw) || vw <= 0) vw = 1334;
+    if (isNaN(vh) || vh <= 0) vh = 750;
+
+    const actualWidth = isVapInput ? Math.floor(vw / 2) : vw;
+    const actualHeight = vh;
+
+    setPhase("جاري إنشاء ملف SVGA...");
+    console.log(
+      `Starting SVGA export: ${actualWidth}x${actualHeight}, ${totalFrames} frames, ${fps} fps (VAP Input: ${isVapInput})`,
+    );
+
+    try {
+      const protoStr = `
+        syntax = "proto3";
+        package com.opensource.svga;
+
+        message MovieParams {
+          float viewBoxWidth = 1;
+          float viewBoxHeight = 2;
+          int32 fps = 3;
+          int32 frames = 4;
+        }
+
+        message Transform {
+          float a = 1;
+          float b = 2;
+          float c = 3;
+          float d = 4;
+          float tx = 5;
+          float ty = 6;
+        }
+
+        message Layout {
+          float x = 1;
+          float y = 2;
+          float width = 3;
+          float height = 4;
+        }
+
+        message SpriteEntity {
+          string imageKey = 1;
+          repeated FrameEntity frames = 2;
+          string matteKey = 3;
+        }
+
+        message FrameEntity {
+          float alpha = 1;
+          Layout layout = 2;
+          Transform transform = 3;
+          string clipPath = 4;
+          repeated ShapeEntity shapes = 5;
+          string blendMode = 6;
+        }
+
+        message ShapeEntity {
+          int32 type = 1;
+          map<string, float> args = 2;
+          map<string, string> styles = 3;
+          Transform transform = 4;
+        }
+
+        message AudioEntity {
+          string audioKey = 1;
+          int32 startFrame = 2;
+          int32 endFrame = 3;
+          int32 startTime = 4;
+          int32 totalTime = 5;
+        }
+
+        message MovieEntity {
+          string version = 1;
+          MovieParams params = 2;
+          map<string, bytes> images = 3;
+          repeated SpriteEntity sprites = 4;
+          repeated AudioEntity audios = 5;
+        }
+      `;
+
+      const root = protobuf.parse(protoStr).root;
+      const MovieEntity = root.lookupType("com.opensource.svga.MovieEntity");
+
+      const imagesData: Record<string, Uint8Array> = {};
+      const finalSprites: any[] = [];
+      const finalAudios: any[] = [];
+
+      if (audioData) {
+        const audioKey = "audio_0";
+        imagesData[audioKey] = ensureMp3WithId3(audioData);
+        finalAudios.push({
+          audioKey: audioKey,
+          startFrame: 0,
+          endFrame: totalFrames,
+          startTime: 0,
+          totalTime: Math.round((totalFrames / fps) * 1000),
+        });
+      }
+
+      const canvas = document.createElement("canvas");
+      canvas.width = actualWidth;
+      canvas.height = actualHeight;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+      const tempCanvas = document.createElement("canvas");
+      tempCanvas.width = vw;
+      tempCanvas.height = vh;
+      const tCtx = tempCanvas.getContext("2d", { willReadFrequently: true });
+
+      const spriteFrames: any[] = [];
+
+      for (let i = 0; i < totalFrames; i++) {
+        const currentFrameTime = getTimeForFrame(i, totalFrames, videoDuration, timingSettings);
+        await captureFrame(
+          video,
+          ctx,
+          tCtx,
+          actualWidth,
+          actualHeight,
+          currentFrameTime,
+        );
+
+        // Use UPNG for extreme lossy compression if quality is below 100
+        let bytes: Uint8Array;
+        if (compressionQuality < 100) {
+          const imageData = ctx.getImageData(0, 0, actualWidth, actualHeight);
+          const colors = Math.max(
+            2,
+            Math.round((compressionQuality / 100) * 256),
+          );
+          const apng = UPNG.encode(
+            [imageData.data.buffer],
+            actualWidth,
+            actualHeight,
+            colors,
+          );
+          bytes = new Uint8Array(apng);
+        } else {
+          // Direct canvas.toBlob avoiding base64 string overhead for large files
+          const frameBlob = await new Promise<Blob | null>((resolve) =>
+            canvas.toBlob(resolve, "image/png"),
+          );
+          if (frameBlob) {
+            const arrayBuffer = await frameBlob.arrayBuffer();
+            bytes = new Uint8Array(arrayBuffer);
+          } else {
+            const base64 = canvas.toDataURL("image/png");
+            const binary = atob(base64.split(",")[1]);
+            bytes = new Uint8Array(binary.length);
+            for (let j = 0; j < binary.length; j++) bytes[j] = binary.charCodeAt(j);
+          }
+        }
+
+        const currentKey = `img_${i}`;
+        imagesData[currentKey] = bytes;
+
+        spriteFrames.push({
+          alpha: 1.0,
+          layout: { x: 0, y: 0, width: actualWidth, height: actualHeight },
+          transform: { a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0 },
+        });
+
+        // In this optimized version, we create one sprite per frame to keep it simple but correct
+        // Actually, standard SVGA usually has one sprite per image key.
+        finalSprites.push({
+          imageKey: currentKey,
+          frames: new Array(totalFrames)
+            .fill({ alpha: 0 })
+            .map((f, idx) => (idx === i ? spriteFrames[i] : f)),
+        });
+
+        if (i % 5 === 0) {
+          setProgress(Math.floor((i / totalFrames) * 100));
+          await new Promise((r) => setTimeout(r, 0));
+        }
+      }
+
+      const payload = {
+        version: "2.0",
+        params: {
+          viewBoxWidth: actualWidth,
+          viewBoxHeight: actualHeight,
+          fps,
+          frames: totalFrames,
+        },
+        images: imagesData,
+        sprites: finalSprites,
+        audios: finalAudios,
+      };
+
+      console.log("Verifying SVGA payload...");
+      const errMsg = MovieEntity.verify(payload);
+      if (errMsg) {
+        console.warn("Payload verification warning:", errMsg);
+      }
+
+      console.log("Creating SVGA movie entity...");
+      const movie = MovieEntity.create(payload);
+
+      console.log("Encoding SVGA movie entity...");
+      const buffer = MovieEntity.encode(movie).finish();
+
+      if (!buffer || buffer.length === 0) {
+        throw new Error("Encoded buffer is empty");
+      }
+
+      console.log(
+        `SVGA buffer size: ${buffer.length} bytes. Compressing with fast Level 6...`,
+      );
+      const compressed = pako.deflate(buffer, { level: 6 });
+
+      console.log(
+        `Compressed SVGA size: ${compressed.length} bytes. Reduction: ${((1 - compressed.length / buffer.length) * 100).toFixed(2)}%`,
+      );
+      downloadBlob(
+        new Blob([compressed]),
+        `${file?.name.replace(".mp4", "")}.svga`,
+      );
+      setProgress(100);
+      setPhase("تم إنشاء ملف SVGA بنجاح!");
+    } catch (err) {
+      console.error("SVGA Export Error:", err);
+      alert("حدث خطأ أثناء إنشاء ملف SVGA: " + (err as any).message);
+    }
+  };
+
+  const exportToGIF = async (
+    video: HTMLVideoElement,
+    vw: number,
+    vh: number,
+    totalFrames: number,
+    fps: number,
+    videoDuration: number,
+    timingSettings: TimingSettings,
+    fileName?: string,
+  ) => {
+    setPhase("جاري إنشاء GIF الشفاف...");
+
+    // Ensure valid dimensions
+    if (isNaN(vw) || vw <= 0) vw = 1334;
+    if (isNaN(vh) || vh <= 0) vh = 750;
+
+    // Fetch worker to avoid path issues
+    let workerUrl = "/gif.worker.js";
+    try {
+      const resp = await fetch(
+        "https://cdnjs.cloudflare.com/ajax/libs/gif.js/0.2.0/gif.worker.js",
+      );
+      const blob = await resp.blob();
+      workerUrl = URL.createObjectURL(blob);
+    } catch (e) {
+      console.error("Failed to fetch GIF worker", e);
+    }
+
+    const gif = new GIF({
+      workers: 2,
+      quality:
+        globalQuality === "high" ? 5 : globalQuality === "medium" ? 10 : 20,
+      width: vw,
+      height: vh,
+      transparent: "rgba(0,0,0,0)",
+      workerScript: workerUrl,
+    });
+
+    const canvas = document.createElement("canvas");
+    canvas.width = vw;
+    canvas.height = vh;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+    const tempCanvas = document.createElement("canvas");
+    tempCanvas.width = isVapInput ? vw * 2 : vw;
+    tempCanvas.height = vh;
+    const tCtx = tempCanvas.getContext("2d", { willReadFrequently: true });
+
+    for (let i = 0; i < totalFrames; i++) {
+      if (ctx && tCtx) {
+        const currentFrameTime = getTimeForFrame(i, totalFrames, videoDuration, timingSettings);
+        await captureFrame(video, ctx, tCtx, vw, vh, currentFrameTime);
+        gif.addFrame(ctx, { copy: true, delay: 1000 / fps });
+      }
+      setProgress(Math.floor((i / totalFrames) * 50));
+    }
+    gif.on("finished", (blob: Blob) => {
+      downloadBlob(blob, `${file?.name}.gif`);
+      setIsProcessing(false);
+      if (workerUrl.startsWith("blob:")) URL.revokeObjectURL(workerUrl);
+    });
+    gif.render();
+  };
+
+  const exportToAPNG = async (
+    video: HTMLVideoElement,
+    vw: number,
+    vh: number,
+    totalFrames: number,
+    fps: number,
+    videoDuration: number,
+    timingSettings: TimingSettings,
+    fileName?: string,
+  ) => {
+    setPhase("جاري إنشاء APNG الشفاف...");
+
+    // Ensure valid dimensions
+    if (isNaN(vw) || vw <= 0) vw = 1334;
+    if (isNaN(vh) || vh <= 0) vh = 750;
+
+    const framesData: ArrayBuffer[] = [];
+    const delays: number[] = [];
+    const canvas = document.createElement("canvas");
+    canvas.width = vw;
+    canvas.height = vh;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+    const tempCanvas = document.createElement("canvas");
+    tempCanvas.width = isVapInput ? vw * 2 : vw;
+    tempCanvas.height = vh;
+    const tCtx = tempCanvas.getContext("2d", { willReadFrequently: true });
+
+    for (let i = 0; i < totalFrames; i++) {
+      if (ctx && tCtx) {
+        const currentFrameTime = getTimeForFrame(i, totalFrames, videoDuration, timingSettings);
+        await captureFrame(video, ctx, tCtx, vw, vh, currentFrameTime);
+        framesData.push(ctx.getImageData(0, 0, vw, vh).data.buffer);
+        delays.push(1000 / fps);
+      }
+      setProgress(Math.floor((i / totalFrames) * 100));
+    }
+    const apngBuffer = UPNG.encode(framesData, vw, vh, 0, delays);
+    downloadBlob(new Blob([apngBuffer]), `${file?.name}.png`);
+  };
+
+  const downloadBlob = (blob: Blob, name: string) => {
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = name;
+    link.click();
+    
+    // Auto companion info file
+    if (!name.endsWith('.sha256') && !name.endsWith('_Info.txt')) {
+      downloadDesignerInfoFile(name, {
+        format: selectedFormat,
+        fps: fps,
+        dimensions: (customWidth && customHeight) ? `${customWidth}x${customHeight}` : undefined
+      });
+    }
+  };
+
+  const calculateChecksum = async (buffer: ArrayBuffer): Promise<string> => {
+    const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+  };
+
+  return (
+    <>
+      <div
+        className="max-w-6xl mx-auto p-6 sm:p-10 bg-slate-900/60 backdrop-blur-3xl rounded-[3rem] border border-white/10 shadow-3xl text-right font-arabic"
+        dir="rtl"
+      >
+        <div className="flex items-center justify-between mb-10">
+          <button
+            onClick={onCancel}
+            className="p-3 hover:bg-white/10 rounded-2xl transition-all text-slate-400 hover:text-white"
+          >
+            <ChevronLeft className="w-6 h-6" />
+          </button>
+          <div className="text-right flex items-center gap-4">
+            <div>
+              <h2 className="text-3xl font-black text-white tracking-tighter">
+                محول الفيديو المباشر
+              </h2>
+              <p className="text-slate-500 text-xs mt-1 font-bold uppercase tracking-widest">
+                تحويل MP4 إلى صيغ متحركة بضغطة واحدة
+              </p>
+            </div>
+            <div className="w-12 h-12 bg-sky-500/20 rounded-2xl flex items-center justify-center border border-sky-500/30">
+              <Zap className="w-6 h-6 text-sky-400 fill-sky-400/20" />
+            </div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 xl:grid-cols-12 gap-10">
+          {/* Left Column: Upload & Formats */}
+          <div className="xl:col-span-4 space-y-6">
+            <div
+              onClick={() => fileInputRef.current?.click()}
+              className={`h-64 rounded-[2.5rem] border-2 border-dashed transition-all flex flex-col items-center justify-center cursor-pointer group relative overflow-hidden ${files.length > 0 ? "border-sky-500 bg-sky-500/5" : "border-white/10 hover:border-sky-500/50 hover:bg-white/5"}`}
+            >
+              <input
+                type="file"
+                ref={fileInputRef}
+                className="hidden"
+                accept="video/*,.vap"
+                multiple
+                onChange={(e) => {
+                  const newFiles = Array.from(e.target.files || []);
+                  if (newFiles.length > 0) {
+                    setFiles((prev) => [...prev, ...newFiles]);
+                  }
+                }}
+              />
+              {file ? (
+                <div className="text-center p-6 relative z-10 w-full h-full flex flex-col items-center justify-center">
+                  {videoUrl ? (
+                    <video
+                      src={videoUrl}
+                      className="max-h-40 rounded-xl mb-2 border border-white/10"
+                      onTimeUpdate={(e) => {
+                        const v = e.currentTarget;
+                        const effectiveStart = isAutoDuration ? 0 : startTime;
+                        const effectiveEnd = isAutoDuration
+                          ? v.duration
+                          : endTime;
+                        if (v.currentTime > effectiveEnd)
+                          v.currentTime = effectiveStart;
+                        if (v.currentTime < effectiveStart)
+                          v.currentTime = effectiveStart;
+                      }}
+                      autoPlay
+                      loop
+                      muted
+                      playsInline
+                    />
+                  ) : (
+                    <div className="w-20 h-20 bg-sky-500/20 rounded-3xl flex items-center justify-center mx-auto mb-4 border border-sky-500/30">
+                      <Film className="w-10 h-10 text-sky-400" />
+                    </div>
+                  )}
+                  <div className="flex items-center gap-2 justify-center">
+                    <div className="text-white font-black truncate max-w-[200px] text-sm">
+                      {file.name}
+                    </div>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        extractAudio();
+                      }}
+                      className="p-1.5 bg-white/10 hover:bg-sky-500/20 rounded-lg transition-all text-slate-400 hover:text-sky-400"
+                      title="تحميل الصوت فقط"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                  <div className="text-sky-400 text-[10px] font-black mt-2 uppercase tracking-widest">
+                    {(file.size / 1024 / 1024).toFixed(2)} MB
+                  </div>
+                </div>
+              ) : (
+                <div className="text-center p-6 relative z-10">
+                  <div className="w-20 h-20 bg-white/5 rounded-3xl flex items-center justify-center mx-auto mb-4 border border-white/5 group-hover:scale-110 transition-transform">
+                    <Video className="w-10 h-10 text-slate-400" />
+                  </div>
+                  <div className="text-white font-black text-sm">
+                    اضغط لرفع الفيديوهات
+                  </div>
+                  <div className="text-slate-500 text-[10px] font-bold mt-2 uppercase tracking-widest">
+                    MP4 فقط
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {files.length > 0 && (
+              <div className="bg-slate-950/40 p-6 rounded-[2.5rem] border border-white/5 space-y-4">
+                <div className="flex items-center justify-between">
+                  <h4 className="text-white font-black text-xs uppercase tracking-widest text-slate-400 flex items-center gap-2">
+                    <Layers className="w-4 h-4 text-sky-500" />
+                    الملفات المرفوعة ({files.length})
+                  </h4>
+                  <button
+                    onClick={() => {
+                      setFiles([]);
+                      setCurrentFileIndex(0);
+                    }}
+                    className="text-[10px] font-black uppercase tracking-widest text-red-400 hover:text-red-300 flex items-center gap-1 transition-colors"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                    مسح الكل
+                  </button>
+                </div>
+                <div className="max-h-48 overflow-y-auto space-y-2 custom-scrollbar pr-2">
+                  {files.map((f, i) => (
+                    <div
+                      key={i}
+                      className={`flex items-center justify-between p-3 rounded-2xl border transition-all ${i === currentFileIndex ? "bg-sky-500/10 border-sky-500/30" : "bg-white/5 border-white/5 hover:border-white/10"}`}
+                    >
+                      <div className="flex items-center gap-3 overflow-hidden">
+                        <div className="w-8 h-8 rounded-lg bg-slate-800 flex items-center justify-center flex-shrink-0">
+                          <Film className="w-4 h-4 text-slate-400" />
+                        </div>
+                        <span className="text-xs text-slate-300 truncate font-bold">
+                          {f.name}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setCurrentFileIndex(i);
+                            handleTransferCurrentFileToAfterEffects(i);
+                          }}
+                          title="حفظ ونقل التعديلات إلى مشروع After Effects (محرر الطبقات)"
+                          className="px-2.5 py-1.5 rounded-xl bg-purple-500/20 text-purple-200 hover:bg-purple-600 hover:text-white border border-purple-500/40 transition-all flex items-center gap-1 text-xs font-bold shadow-sm"
+                        >
+                          <Layers className="w-3.5 h-3.5 text-purple-300" />
+                          <span className="hidden sm:inline">نقل للطبقات</span>
+                          <Crown className="w-3 h-3 text-amber-400" />
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setCurrentFileIndex(i);
+                          }}
+                          className={`p-1.5 rounded-lg transition-colors ${i === currentFileIndex ? "bg-sky-500 text-white" : "bg-slate-800 text-slate-400 hover:text-white"}`}
+                        >
+                          <Maximize className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            const newFiles = [...files];
+                            newFiles.splice(i, 1);
+                            setFiles(newFiles);
+                            if (currentFileIndex >= newFiles.length) {
+                              setCurrentFileIndex(
+                                Math.max(0, newFiles.length - 1),
+                              );
+                            }
+                          }}
+                          className="p-1.5 rounded-lg bg-slate-800 text-slate-400 hover:text-red-400 transition-colors"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Quick Transfer to After Effects / SVGA Layer Editor Card */}
+            {file && (
+              <div className="bg-gradient-to-r from-purple-950/40 via-indigo-950/30 to-slate-900/60 p-5 rounded-[2.5rem] border-2 border-purple-500/40 shadow-2xl shadow-purple-950/30 space-y-3 relative overflow-hidden">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-2xl bg-gradient-to-tr from-purple-600 to-indigo-600 flex items-center justify-center text-white shadow-lg shadow-purple-500/30">
+                      <Layers className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <div className="text-white font-black text-sm flex items-center gap-2">
+                        نقل إلى مشروع محرر الطبقات (After Effects)
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-amber-500/20 text-amber-300 border border-amber-500/40 flex items-center gap-1">
+                          <Crown className="w-2.5 h-2.5 text-amber-400" /> VIP
+                        </span>
+                      </div>
+                      <p className="text-slate-300 text-xs mt-0.5">
+                        حفظ كافة عمليات القص وإزالة الخلفية الخضراء والكروما والسرعة ونقلها بنفس الإعدادات إلى المشروع
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Badges summarizing all active edits */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 bg-black/40 p-3 rounded-2xl border border-white/5 text-[11px]">
+                  <div className="flex items-center gap-1.5 text-slate-300">
+                    <span className={`w-2 h-2 rounded-full ${removeGreen ? "bg-emerald-400" : "bg-slate-600"}`} />
+                    <span>الخلفية الخضراء:</span>
+                    <strong className={removeGreen ? "text-emerald-400" : "text-slate-400"}>
+                      {removeGreen ? "إزالة ✓" : "بدون"}
+                    </strong>
+                  </div>
+                  <div className="flex items-center gap-1.5 text-slate-300">
+                    <span className={`w-2 h-2 rounded-full ${(customChroma?.enabled || removeBlack || removeWhite || removeBlue) ? "bg-emerald-400" : "bg-slate-600"}`} />
+                    <span>الكروما المخصصة:</span>
+                    <strong className={(customChroma?.enabled || removeBlack || removeWhite || removeBlue) ? "text-emerald-400" : "text-slate-400"}>
+                      {customChroma?.enabled ? "محددة ✓" : (removeBlack ? "أسود ✓" : (removeWhite ? "أبيض ✓" : (removeBlue ? "أزرق ✓" : "بدون")))}
+                    </strong>
+                  </div>
+                  <div className="flex items-center gap-1.5 text-slate-300">
+                    <span className={`w-2 h-2 rounded-full ${(!isAutoDuration || timingSettings.mode !== "full") ? "bg-amber-400" : "bg-sky-400"}`} />
+                    <span>المدة المقصوصة:</span>
+                    <strong className="text-amber-300 font-mono">
+                      {calculateOutputDuration(duration, timingSettings).toFixed(2)}s
+                    </strong>
+                  </div>
+                  <div className="flex items-center gap-1.5 text-slate-300">
+                    <span className="w-2 h-2 rounded-full bg-indigo-400" />
+                    <span>الصوت المتزامن:</span>
+                    <strong className="text-indigo-300">
+                      مزامنة تلقائية ✓
+                    </strong>
+                  </div>
+                </div>
+
+                <button
+                  onClick={() => handleTransferCurrentFileToAfterEffects()}
+                  disabled={isTransferringToAe}
+                  className="w-full py-3.5 px-5 rounded-2xl bg-gradient-to-r from-purple-600 via-indigo-600 to-sky-600 hover:from-purple-500 hover:via-indigo-500 hover:to-sky-500 text-white font-black text-xs flex items-center justify-center gap-2 shadow-xl shadow-purple-600/30 transition-all hover:scale-[1.01] active:scale-[0.99] disabled:opacity-50"
+                >
+                  {isTransferringToAe ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                      <span>{aeTransferPhase || "جاري تجهيز ونقل المشروع..."}</span>
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="w-4 h-4 text-amber-300" />
+                      <span>حفظ ونقل كافة التعديلات إلى مشروع After Effects الآن</span>
+                      <ArrowLeft className="w-4 h-4" />
+                    </>
+                  )}
+                </button>
+              </div>
+            )}
+
+            {file && (
+              <div className="bg-slate-950/40 p-6 rounded-[2.5rem] border border-white/5 space-y-4">
+                <h4 className="text-white font-black text-xs uppercase tracking-widest text-slate-400 flex items-center gap-2">
+                  <Scissors className="w-3.5 h-3.5 text-sky-400" />
+                  التحكم بالمدة والسرعة وقص المشاهد:
+                </h4>
+                <div className="flex flex-col gap-3">
+                  {/* Flagship: Speed-based Duration Compression without Cropping */}
+                  <button
+                    onClick={() => setShowDurationSpeedModal(true)}
+                    className="w-full relative group overflow-hidden bg-gradient-to-r from-amber-500/15 via-orange-500/10 to-yellow-500/15 hover:from-amber-500/25 hover:via-orange-500/20 hover:to-yellow-500/25 border border-amber-500/40 p-4 rounded-2xl transition-all duration-300 flex items-center justify-between shadow-xl shadow-amber-500/10"
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-amber-500 to-orange-600 text-white flex items-center justify-center shadow-lg shadow-amber-500/25">
+                        <FastForward className="w-5 h-5" />
+                      </div>
+                      <div className="text-right">
+                        <div className="text-white font-black text-sm flex items-center gap-2">
+                          التحكم في مدة الفيديو بالسرعة (بدون قص أي مشهد)
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                            Zero-Crop
+                          </span>
+                        </div>
+                        <div className="text-slate-300 text-[10px] font-bold tracking-wider mt-1">
+                          تغيير المدة النهائية عبر تسريع التشغيل مع الحفاظ على كافة المشاهد، الإطارات، والصوت
+                        </div>
+                      </div>
+                    </div>
+                    <div className="text-left bg-black/40 px-3.5 py-2 rounded-xl border border-white/10">
+                      <div className="text-amber-400 font-black text-sm font-mono">
+                        {calculateOutputDuration(duration, timingSettings).toFixed(2)}s
+                      </div>
+                      <div className="text-slate-400 text-[10px] font-bold">
+                        {duration > 0 && calculateOutputDuration(duration, timingSettings) > 0
+                          ? `${(duration / calculateOutputDuration(duration, timingSettings)).toFixed(2)}× سرعة`
+                          : "المدة النهائية"}
+                      </div>
+                    </div>
+                  </button>
+
+                  <button
+                    onClick={() => setShowTrimmer(true)}
+                    className="w-full relative group overflow-hidden bg-gradient-to-r from-sky-500/10 via-indigo-500/10 to-purple-500/10 hover:from-sky-500/20 hover:via-indigo-500/20 hover:to-purple-500/20 border border-sky-500/30 p-4 rounded-2xl transition-all duration-300 flex items-center justify-between shadow-lg shadow-sky-500/5"
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-sky-500 to-indigo-600 text-white flex items-center justify-center shadow-glow-sky">
+                        <Scissors className="w-5 h-5" />
+                      </div>
+                      <div className="text-right">
+                        <div className="text-white font-black text-sm flex items-center gap-2">
+                          أداة القص والتحكم بالسرعة الاحترافية
+                          {timingSettings.mode !== "full" && (
+                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-sky-500/20 text-sky-300 border border-sky-500/30">
+                              {timingSettings.mode === "trim" ? "قص مخصص" : timingSettings.mode === "segment_speed" ? "تسريع مقطع" : timingSettings.mode === "fit_duration" ? "تعديل مدة" : "تسريع كامل"}
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-slate-400 text-[10px] uppercase font-bold tracking-wider mt-1">
+                          عرض كل إطارات الفيديو، تسريع مقاطع معينة دون حذف، وقص المشاهد بدقة
+                        </div>
+                      </div>
+                    </div>
+                    <div className="text-left bg-slate-900/60 px-3 py-1.5 rounded-xl border border-white/5">
+                      <div className="text-emerald-400 font-black text-sm">
+                        {calculateOutputDuration(duration, timingSettings).toFixed(2)}s
+                      </div>
+                      <div className="text-slate-500 text-[10px] font-semibold">
+                        مدة التصدير
+                      </div>
+                    </div>
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <div className="bg-slate-950/40 p-6 rounded-[2.5rem] border border-white/5">
+              <h4 className="text-white font-black mb-4 text-xs uppercase tracking-widest text-slate-400 flex items-center gap-2">
+                <Layers className="w-3 h-3" />
+                اختر صيغة التصدير:
+              </h4>
+              <div className="grid grid-cols-1 gap-3">
+                {formats.map((f) => (
+                  <button
+                    key={f.id}
+                    onClick={() => setSelectedFormat(f.id)}
+                    className={`flex items-center gap-4 p-4 rounded-2xl border transition-all text-right group ${selectedFormat === f.id ? "bg-sky-500 border-sky-400 text-white shadow-glow-sky" : "bg-white/5 border-white/5 text-slate-400 hover:bg-white/10"}`}
+                  >
+                    <div
+                      className={`w-10 h-10 rounded-xl flex items-center justify-center transition-colors ${selectedFormat === f.id ? "bg-white/20" : "bg-white/5 group-hover:bg-white/10"}`}
+                    >
+                      {f.id === "VAP (MP4)" && <Video className="w-5 h-5" />}
+                      {f.id === "SVGA 2.0" && <Box className="w-5 h-5" />}
+                      {f.id === "GIF (Animation)" && (
+                        <ImageIcon className="w-5 h-5" />
+                      )}
+                      {f.id === "APNG (Animation)" && (
+                        <Film className="w-5 h-5" />
+                      )}
+                    </div>
+                    <div>
+                      <div className="font-black text-xs">{f.name}</div>
+                      <div
+                        className={`text-[9px] mt-0.5 ${selectedFormat === f.id ? "text-white/70" : "text-slate-500"}`}
+                      >
+                        {f.desc}
+                      </div>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Middle Column: Advanced Settings */}
+          <div className="xl:col-span-5 space-y-6">
+            <div className="bg-slate-950/40 p-8 rounded-[3rem] border border-white/5 space-y-8">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Settings2 className="w-4 h-4 text-sky-400" />
+                  <span className="text-white font-black text-xs uppercase tracking-widest">
+                    إعدادات متقدمة
+                  </span>
+                </div>
+                <div className="px-3 py-1 bg-sky-500/10 text-sky-400 text-[9px] font-black rounded-lg border border-sky-500/20">
+                  ADVANCED MODE
+                </div>
+              </div>
+
+              {/* Batch & Verification Options */}
+              <div className="grid grid-cols-2 gap-4 pb-4 border-b border-white/5">
+                <div className="space-y-2">
+                  <div className="text-[10px] font-black text-slate-500 uppercase tracking-widest">
+                    دمج الفيديوهات
+                  </div>
+                  <button
+                    onClick={() => setIsMerging(!isMerging)}
+                    className={`w-full p-3 rounded-2xl border transition-all flex items-center justify-between ${isMerging ? "bg-sky-500/10 border-sky-500/30 text-sky-400" : "bg-white/5 border-white/5 text-slate-500 hover:border-white/10"}`}
+                  >
+                    <Layers className="w-4 h-4" />
+                    <span className="text-[10px] font-black">
+                      {isMerging ? "مفعل" : "معطل"}
+                    </span>
+                  </button>
+                </div>
+                <div className="space-y-2">
+                  <div className="text-[10px] font-black text-slate-500 uppercase tracking-widest">
+                    ملف التحقق (SHA-256)
+                  </div>
+                  <button
+                    onClick={() => setGenerateChecksum(!generateChecksum)}
+                    className={`w-full p-3 rounded-2xl border transition-all flex items-center justify-between ${generateChecksum ? "bg-sky-500/10 border-sky-500/30 text-sky-400" : "bg-white/5 border-white/5 text-slate-500 hover:border-white/10"}`}
+                  >
+                    <Download className="w-4 h-4" />
+                    <span className="text-[10px] font-black">
+                      {generateChecksum ? "مفعل" : "معطل"}
+                    </span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Duration Settings */}
+              <div className="space-y-4 pb-4 border-b border-white/5">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Clock className="w-3 h-3 text-amber-400" />
+                    <span className="text-slate-400 text-[10px] font-black uppercase tracking-widest">
+                      مدة الفيديو
+                    </span>
+                  </div>
+                  <div className="flex gap-1 bg-white/5 p-1 rounded-lg border border-white/10">
+                    <button
+                      onClick={() => {
+                        setDurationMode("auto");
+                        setIsAutoDuration(true);
+                        setTimingSettings(DEFAULT_TIMING_SETTINGS);
+                      }}
+                      className={`px-2.5 py-1 rounded-md text-[9px] font-black uppercase transition-all ${
+                        durationMode === "auto" && isAutoDuration
+                          ? "bg-amber-500 text-white shadow-glow-amber"
+                          : "text-slate-500 hover:text-white"
+                      }`}
+                    >
+                      تلقائي
+                    </button>
+                    <button
+                      onClick={() => {
+                        setDurationMode("speed_fit");
+                        setIsAutoDuration(false);
+                        setTimingSettings({
+                          ...DEFAULT_TIMING_SETTINGS,
+                          mode: "fit_duration",
+                          targetDuration: targetSpeedDuration,
+                        });
+                      }}
+                      className={`px-2.5 py-1 rounded-md text-[9px] font-black uppercase transition-all ${
+                        durationMode === "speed_fit"
+                          ? "bg-amber-500 text-white shadow-glow-amber"
+                          : "text-slate-500 hover:text-white"
+                      }`}
+                    >
+                      ضغط بالسرعة
+                    </button>
+                    <button
+                      onClick={() => {
+                        setDurationMode("trim");
+                        setIsAutoDuration(false);
+                        setTimingSettings({
+                          ...DEFAULT_TIMING_SETTINGS,
+                          mode: "trim",
+                          startTime: startTime,
+                          endTime: endTime || duration,
+                        });
+                      }}
+                      className={`px-2.5 py-1 rounded-md text-[9px] font-black uppercase transition-all ${
+                        durationMode === "trim"
+                          ? "bg-amber-500 text-white shadow-glow-amber"
+                          : "text-slate-500 hover:text-white"
+                      }`}
+                    >
+                      قص يدوي
+                    </button>
+                  </div>
+                </div>
+
+                {durationMode === "speed_fit" && (
+                  <div className="p-3.5 rounded-2xl bg-amber-500/10 border border-amber-500/30 space-y-3 animate-in fade-in duration-300">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="font-black text-amber-300">المدة المطلوبة (بدون قص المشاهد):</span>
+                      <span className="font-mono font-bold text-amber-400">
+                        {duration > 0 ? (duration / Math.max(0.1, targetSpeedDuration)).toFixed(2) : 1.00}× سرعة
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <div className="relative flex-1">
+                        <input
+                          type="number"
+                          step="0.5"
+                          min="0.5"
+                          max="300"
+                          value={targetSpeedDuration}
+                          onChange={(e) => {
+                            const val = Math.max(0.1, parseFloat(e.target.value) || 1);
+                            setTargetSpeedDuration(val);
+                            setTimingSettings((prev) => ({
+                              ...prev,
+                              mode: "fit_duration",
+                              targetDuration: val,
+                            }));
+                          }}
+                          className="w-full bg-slate-950 border border-amber-500/40 rounded-xl px-3 py-2 text-white font-mono text-center font-bold text-sm outline-none"
+                          placeholder="10.0"
+                        />
+                        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-[10px] text-slate-400 font-bold">
+                          ثانية
+                        </span>
+                      </div>
+
+                      <button
+                        onClick={() => setShowDurationSpeedModal(true)}
+                        className="px-3 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-white font-black text-xs transition-all flex items-center gap-1.5 shadow-md shadow-amber-500/20"
+                      >
+                        <FastForward className="w-3.5 h-3.5" />
+                        <span>معاينة بالسرعة</span>
+                      </button>
+                    </div>
+
+                    <div className="flex gap-1">
+                      {[2, 5, 10, 15, 30].map((preset) => (
+                        <button
+                          key={preset}
+                          onClick={() => {
+                            setTargetSpeedDuration(preset);
+                            setTimingSettings((prev) => ({
+                              ...prev,
+                              mode: "fit_duration",
+                              targetDuration: preset,
+                            }));
+                          }}
+                          className={`flex-1 py-1 rounded-lg text-[10px] font-black transition-all border ${
+                            Math.abs(targetSpeedDuration - preset) < 0.1
+                              ? "bg-amber-500 text-white border-amber-400"
+                              : "bg-white/5 border-white/5 text-slate-400 hover:text-white"
+                          }`}
+                        >
+                          {preset}s
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {durationMode === "trim" && (
+                  <div className="grid grid-cols-2 gap-4 animate-in fade-in slide-in-from-top-2 duration-300">
+                    <div className="space-y-2">
+                      <label className="text-[9px] text-slate-500 font-black uppercase tracking-widest block">
+                        البداية (ثانية)
+                      </label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        min="0"
+                        max={duration}
+                        value={startTime}
+                        onChange={(e) => {
+                          const val = Math.max(0, Math.min(duration, parseFloat(e.target.value) || 0));
+                          setStartTime(val);
+                          setTimingSettings((prev) => ({
+                            ...prev,
+                            mode: "trim",
+                            startTime: val,
+                            endTime: endTime || duration,
+                          }));
+                        }}
+                        className="w-full bg-white/5 border border-white/10 rounded-xl p-3 text-white text-xs focus:border-amber-500 outline-none transition-all"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-[9px] text-slate-500 font-black uppercase tracking-widest block">
+                        النهاية (ثانية)
+                      </label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        min="0"
+                        max={duration}
+                        value={endTime}
+                        onChange={(e) => {
+                          const val = Math.max(0, Math.min(duration, parseFloat(e.target.value) || duration));
+                          setEndTime(val);
+                          setTimingSettings((prev) => ({
+                            ...prev,
+                            mode: "trim",
+                            startTime: startTime,
+                            endTime: val,
+                          }));
+                        }}
+                        className="w-full bg-white/5 border border-white/10 rounded-xl p-3 text-white text-xs focus:border-amber-500 outline-none transition-all"
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div className="space-y-4 pb-4 border-b border-white/5">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Settings2 className="w-3 h-3 text-sky-400" />
+                    <span className="text-slate-400 text-[10px] font-black uppercase tracking-widest">
+                      جودة التصدير
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2 bg-slate-900/50 px-3 py-1.5 rounded-lg border border-white/5">
+                    <span className="text-[10px] text-slate-400 font-bold uppercase">
+                      الضغط:
+                    </span>
+                    <input
+                      type="number"
+                      min="0"
+                      max="100"
+                      value={compressionRatio}
+                      onChange={(e) =>
+                        setCompressionRatio(
+                          Math.max(
+                            0,
+                            Math.min(100, parseInt(e.target.value) || 100),
+                          ),
+                        )
+                      }
+                      className="w-12 bg-transparent text-emerald-400 text-xs font-black text-center focus:outline-none"
+                    />
+                    <span className="text-[10px] text-emerald-500/50 font-black">
+                      %
+                    </span>
+                  </div>
+                </div>
+                <div className="px-1">
+                  <input
+                    type="range"
+                    min="0"
+                    max="100"
+                    step="1"
+                    value={compressionRatio}
+                    onChange={(e) =>
+                      setCompressionRatio(parseInt(e.target.value))
+                    }
+                    className="w-full h-1.5 bg-white/5 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+                  />
+                </div>
+                <div className="flex gap-1 bg-white/5 p-1 rounded-xl border border-white/10">
+                  <button
+                    onClick={() => {
+                      setGlobalQuality("low");
+                      setCustomBitrate("");
+                    }}
+                    className={`flex-1 py-2 rounded-lg text-[10px] font-black uppercase transition-all ${globalQuality === "low" && !customBitrate ? "bg-red-500/20 text-red-400 shadow-glow-red" : "text-slate-500 hover:text-white hover:bg-white/5"}`}
+                  >
+                    منخفضة
+                  </button>
+                  <button
+                    onClick={() => {
+                      setGlobalQuality("medium");
+                      setCustomBitrate("");
+                    }}
+                    className={`flex-1 py-2 rounded-lg text-[10px] font-black uppercase transition-all ${globalQuality === "medium" && !customBitrate ? "bg-yellow-500/20 text-yellow-400 shadow-glow-yellow" : "text-slate-500 hover:text-white hover:bg-white/5"}`}
+                  >
+                    متوسطة
+                  </button>
+                  <button
+                    onClick={() => {
+                      setGlobalQuality("high");
+                      setCustomBitrate("");
+                    }}
+                    className={`flex-1 py-2 rounded-lg text-[10px] font-black uppercase transition-all ${globalQuality === "high" && !customBitrate ? "bg-emerald-500/20 text-emerald-400 shadow-glow-green" : "text-slate-500 hover:text-white hover:bg-white/5"}`}
+                  >
+                    عالية
+                  </button>
+                </div>
+              </div>
+
+              {/* FPS & Bitrate Settings */}
+              <div className="grid grid-cols-2 gap-4 pb-4 border-b border-white/5">
+                <div className="space-y-2">
+                  <div className="flex justify-between items-center">
+                    <div className="flex items-center gap-2">
+                      <Film className="w-3 h-3 text-slate-500" />
+                      <label className="text-[9px] text-slate-500 font-black uppercase tracking-widest block">
+                        معدل الفريمات (FPS)
+                      </label>
+                    </div>
+                    <span className="text-sky-400 font-black text-[10px]">
+                      {fps}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min="10"
+                    max="60"
+                    step="1"
+                    value={fps}
+                    onChange={(e) => setFps(parseInt(e.target.value))}
+                    className="w-full h-1.5 bg-white/5 rounded-lg appearance-none cursor-pointer accent-sky-500"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <div className="flex justify-between items-center">
+                    <div className="flex items-center gap-2">
+                      <Zap className="w-3 h-3 text-slate-500" />
+                      <label className="text-[9px] text-slate-500 font-black uppercase tracking-widest block">
+                        نسبة الضغط (Mbps)
+                      </label>
+                    </div>
+                    <span className="text-sky-400 font-black text-[10px]">
+                      {customBitrate ||
+                        (globalQuality === "high"
+                          ? "15"
+                          : globalQuality === "medium"
+                            ? "8"
+                            : "4")}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min="1"
+                    max="30"
+                    step="1"
+                    value={
+                      customBitrate ||
+                      (globalQuality === "high"
+                        ? 15
+                        : globalQuality === "medium"
+                          ? 8
+                          : 4)
+                    }
+                    onChange={(e) => setCustomBitrate(parseInt(e.target.value))}
+                    className="w-full h-1.5 bg-white/5 rounded-lg appearance-none cursor-pointer accent-sky-500"
+                  />
+                </div>
+              </div>
+
+              {/* SVGA Compression Quality */}
+              {selectedFormat === "SVGA 2.0" && (
+                <div className="space-y-4 pb-4 border-b border-white/5">
+                  <div className="flex justify-between items-center">
+                    <div className="flex items-center gap-2">
+                      <Zap className="w-3 h-3 text-sky-400" />
+                      <label className="text-[9px] text-slate-500 font-black uppercase tracking-widest block">
+                        جودة ضغط صور SVGA
+                      </label>
+                    </div>
+                    <span className="text-sky-400 font-black text-[10px]">
+                      {compressionQuality}%
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min="1"
+                    max="100"
+                    step="1"
+                    value={compressionQuality}
+                    onChange={(e) =>
+                      setCompressionQuality(parseInt(e.target.value))
+                    }
+                    className="w-full h-1.5 bg-white/5 rounded-lg appearance-none cursor-pointer accent-sky-500"
+                  />
+                  <div className="space-y-1">
+                    <p className="text-[8px] text-slate-500 font-black uppercase tracking-widest leading-relaxed">
+                      * للحصول على أصغر حجم ملف (ضغط فائق):
+                    </p>
+                    <p className="text-[8px] text-sky-400/70 font-black uppercase tracking-widest leading-relaxed">
+                      1. قلل "جودة ضغط صور SVGA" إلى 10-30%
+                    </p>
+                    <p className="text-[8px] text-sky-400/70 font-black uppercase tracking-widest leading-relaxed">
+                      2. قلل "معدل الفريمات (FPS)" إلى 15 أو أقل
+                    </p>
+                    <p className="text-[8px] text-sky-400/70 font-black uppercase tracking-widest leading-relaxed">
+                      3. قلل "مقياس سريع" إلى 50% أو أقل
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* Scale Inputs */}
+              <div className="space-y-4">
+                <div className="flex justify-between items-center">
+                  <div className="flex items-center gap-2">
+                    <Maximize className="w-3 h-3 text-slate-500" />
+                    <span className="text-slate-400 text-[10px] font-black uppercase tracking-widest">
+                      أبعاد التصدير
+                    </span>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <label className="text-[9px] text-slate-500 font-black uppercase tracking-widest block">
+                      العرض (Width)
+                    </label>
+                    <input
+                      type="number"
+                      value={customWidth}
+                      onChange={(e) =>
+                        setCustomWidth(
+                          e.target.value ? parseInt(e.target.value) : "",
+                        )
+                      }
+                      placeholder="تلقائي"
+                      className="w-full bg-white/5 border border-white/10 rounded-xl p-3 text-white text-xs focus:border-sky-500 outline-none transition-all"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-[9px] text-slate-500 font-black uppercase tracking-widest block">
+                      الارتفاع (Height)
+                    </label>
+                    <input
+                      type="number"
+                      value={customHeight}
+                      onChange={(e) =>
+                        setCustomHeight(
+                          e.target.value ? parseInt(e.target.value) : "",
+                        )
+                      }
+                      placeholder="تلقائي"
+                      className="w-full bg-white/5 border border-white/10 rounded-xl p-3 text-white text-xs focus:border-sky-500 outline-none transition-all"
+                    />
+                  </div>
+                </div>
+                {!customWidth && !customHeight && (
+                  <div className="pt-2">
+                    <div className="flex justify-between items-center mb-2">
+                      <span className="text-slate-500 text-[9px] font-black uppercase tracking-widest">
+                        مقياس سريع
+                      </span>
+                      <span className="text-sky-400 font-black text-xs">
+                        {Math.round(exportScale * 100)}%
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0.1"
+                      max="2.0"
+                      step="0.1"
+                      value={exportScale}
+                      onChange={(e) =>
+                        setExportScale(parseFloat(e.target.value))
+                      }
+                      className="w-full h-1.5 bg-white/5 rounded-lg appearance-none cursor-pointer accent-sky-500"
+                    />
+                  </div>
+                )}
+              </div>
+
+              {/* Audio Upload */}
+              <div className="space-y-4 pt-4 border-t border-white/5">
+                <div className="flex items-center gap-2">
+                  <Music className="w-3 h-3 text-slate-500" />
+                  <span className="text-slate-400 text-[10px] font-black uppercase tracking-widest">
+                    إضافة صوت (اختياري)
+                  </span>
+                </div>
+                <div
+                  onClick={() => audioInputRef.current?.click()}
+                  className={`p-4 rounded-2xl border-2 border-dashed transition-all flex items-center gap-4 cursor-pointer ${audioFile ? "border-emerald-500 bg-emerald-500/5" : "border-white/5 hover:border-white/10"}`}
+                >
+                  <input
+                    type="file"
+                    ref={audioInputRef}
+                    className="hidden"
+                    accept="audio/*"
+                    onChange={(e) => setAudioFile(e.target.files?.[0] || null)}
+                  />
+                  <div
+                    className={`w-10 h-10 rounded-xl flex items-center justify-center ${audioFile ? "bg-emerald-500/20 text-emerald-400" : "bg-white/5 text-slate-500"}`}
+                  >
+                    <Music className="w-5 h-5" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-white text-[10px] font-black truncate">
+                      {audioFile ? audioFile.name : "اختر ملف صوتي"}
+                    </div>
+                    <div className="text-slate-500 text-[8px] uppercase tracking-widest">
+                      {audioFile
+                        ? `${(audioFile.size / 1024).toFixed(1)} KB`
+                        : "MP3, WAV..."}
+                    </div>
+                  </div>
+                  {audioFile && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setAudioFile(null);
+                      }}
+                      className="p-2 hover:bg-white/10 rounded-lg text-slate-400 hover:text-red-400 transition-colors"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Custom Chroma Eyedropper Studio Card */}
+              <div className="p-5 rounded-3xl bg-gradient-to-br from-emerald-500/10 via-slate-900 to-teal-500/10 border border-emerald-500/30 relative overflow-hidden shadow-xl">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                  <div className="flex items-center gap-3.5">
+                    <div className="w-12 h-12 rounded-2xl bg-gradient-to-tr from-emerald-500 to-teal-400 flex items-center justify-center text-slate-950 shadow-lg shadow-emerald-500/20">
+                      <Pipette className="w-6 h-6" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-white font-black text-sm">
+                          قلم وقطارة تحديد لون الكروما من الفيديو
+                        </span>
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                          PRO
+                        </span>
+                      </div>
+                      <p className="text-slate-400 text-xs mt-0.5">
+                        افتح الفيديو وحدد أي درجة لون بدقة لعزل الخلفية وتفريغها لأي صيغة
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={() => setShowChromaStudio(true)}
+                      className="px-5 py-2.5 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 font-black text-xs transition-all shadow-lg shadow-emerald-500/20 flex items-center gap-2 cursor-pointer active:scale-95"
+                    >
+                      <Pipette className="w-4 h-4" />
+                      فتح قلم سحب اللون 🎯
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setCustomChroma((prev) => ({
+                          ...prev,
+                          enabled: !prev.enabled,
+                        }))
+                      }
+                      className={`w-12 h-6 rounded-full relative transition-colors cursor-pointer ${
+                        customChroma.enabled ? "bg-emerald-500" : "bg-slate-700"
+                      }`}
+                      title={customChroma.enabled ? "تعطيل العزل" : "تفعيل العزل"}
+                    >
+                      <div
+                        className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-all ${
+                          customChroma.enabled ? "right-7" : "right-1"
+                        }`}
+                      />
+                    </button>
+                  </div>
+                </div>
+
+                {/* Active Custom Chroma Info & Live Sliders */}
+                {customChroma.enabled && (
+                  <div className="mt-4 pt-4 border-t border-white/10 grid grid-cols-1 md:grid-cols-3 gap-4">
+                    {/* Active Color Swatch */}
+                    <div className="flex items-center gap-3 bg-black/30 p-3 rounded-2xl border border-white/5">
+                      <span
+                        className="w-8 h-8 rounded-xl border border-white/30 shadow-md flex-shrink-0"
+                        style={{ backgroundColor: customChroma.color }}
+                      />
+                      <div className="min-w-0">
+                        <div className="text-[10px] text-slate-400 font-bold">اللون المعزول:</div>
+                        <div className="text-xs font-mono font-black text-emerald-400 uppercase">
+                          {customChroma.color}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setShowChromaStudio(true)}
+                        className="mr-auto text-[10px] text-emerald-300 hover:text-white bg-white/5 hover:bg-white/10 px-2 py-1 rounded-lg transition-colors"
+                      >
+                        تعديل
+                      </button>
+                    </div>
+
+                    {/* Tolerance slider */}
+                    <div className="space-y-1 bg-black/30 p-3 rounded-2xl border border-white/5">
+                      <div className="flex justify-between text-[10px] font-black text-slate-400">
+                        <span>الحساسية (Tolerance)</span>
+                        <span className="text-emerald-400">{customChroma.tolerance}%</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="1"
+                        max="100"
+                        value={customChroma.tolerance}
+                        onChange={(e) =>
+                          setCustomChroma((prev) => ({
+                            ...prev,
+                            tolerance: parseInt(e.target.value),
+                          }))
+                        }
+                        className="w-full h-1.5 bg-white/10 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+                      />
+                    </div>
+
+                    {/* Smoothness slider */}
+                    <div className="space-y-1 bg-black/30 p-3 rounded-2xl border border-white/5">
+                      <div className="flex justify-between text-[10px] font-black text-slate-400">
+                        <span>النعومة (Smoothness)</span>
+                        <span className="text-emerald-400">{customChroma.smoothness}%</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="0"
+                        max="50"
+                        value={customChroma.smoothness}
+                        onChange={(e) =>
+                          setCustomChroma((prev) => ({
+                            ...prev,
+                            smoothness: parseInt(e.target.value),
+                          }))
+                        }
+                        className="w-full h-1.5 bg-white/10 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Preset Chroma & Background Removal Buttons */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <button
+                  onClick={() => setRemoveBlack(!removeBlack)}
+                  className={`w-full p-5 rounded-2xl border transition-all flex items-center justify-between group ${removeBlack ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-400" : "bg-white/5 border-white/5 text-slate-500"}`}
+                >
+                  <div className="flex items-center gap-3">
+                    <Moon
+                      className={`w-5 h-5 transition-colors ${removeBlack ? "text-emerald-400" : "text-slate-500"}`}
+                    />
+                    <span className="font-black text-xs uppercase tracking-widest">
+                      إزالة الخلفية السوداء
+                    </span>
+                  </div>
+                  <div
+                    className={`w-10 h-5 rounded-full relative transition-colors ${removeBlack ? "bg-emerald-500" : "bg-slate-700"}`}
+                  >
+                    <div
+                      className={`absolute top-1 w-3 h-3 bg-white rounded-full transition-all ${removeBlack ? "right-6" : "right-1"}`}
+                    ></div>
+                  </div>
+                </button>
+
+                <button
+                  onClick={() => setRemoveGreen(!removeGreen)}
+                  className={`w-full p-5 rounded-2xl border transition-all flex items-center justify-between group ${removeGreen ? "bg-green-500/10 border-green-500/30 text-green-400" : "bg-white/5 border-white/5 text-slate-500"}`}
+                >
+                  <div className="flex items-center gap-3">
+                    <div
+                      className={`w-5 h-5 rounded-md border-2 transition-colors ${removeGreen ? "bg-green-500 border-green-400" : "bg-transparent border-slate-500"}`}
+                    ></div>
+                    <span className="font-black text-xs uppercase tracking-widest">
+                      إزالة الكروما (أخضر)
+                    </span>
+                  </div>
+                  <div
+                    className={`w-10 h-5 rounded-full relative transition-colors ${removeGreen ? "bg-green-500" : "bg-slate-700"}`}
+                  >
+                    <div
+                      className={`absolute top-1 w-3 h-3 bg-white rounded-full transition-all ${removeGreen ? "right-6" : "right-1"}`}
+                    ></div>
+                  </div>
+                </button>
+
+                <button
+                  onClick={() => setRemoveBlue(!removeBlue)}
+                  className={`w-full p-5 rounded-2xl border transition-all flex items-center justify-between group ${removeBlue ? "bg-blue-500/10 border-blue-500/30 text-blue-400" : "bg-white/5 border-white/5 text-slate-500"}`}
+                >
+                  <div className="flex items-center gap-3">
+                    <div
+                      className={`w-5 h-5 rounded-md border-2 transition-colors ${removeBlue ? "bg-blue-600 border-blue-400" : "bg-transparent border-slate-500"}`}
+                    ></div>
+                    <span className="font-black text-xs uppercase tracking-widest">
+                      إزالة الكروما (أزرق)
+                    </span>
+                  </div>
+                  <div
+                    className={`w-10 h-5 rounded-full relative transition-colors ${removeBlue ? "bg-blue-600" : "bg-slate-700"}`}
+                  >
+                    <div
+                      className={`absolute top-1 w-3 h-3 bg-white rounded-full transition-all ${removeBlue ? "right-6" : "right-1"}`}
+                    ></div>
+                  </div>
+                </button>
+
+                <button
+                  onClick={() => setRemoveWhite(!removeWhite)}
+                  className={`w-full p-5 rounded-2xl border transition-all flex flex-col items-start justify-between group ${removeWhite ? "bg-slate-200/10 border-slate-200/30 text-slate-200" : "bg-white/5 border-white/5 text-slate-500"}`}
+                >
+                  <div className="flex items-center justify-between w-full mb-2">
+                    <div className="flex items-center gap-3">
+                      <div
+                        className={`w-5 h-5 rounded-md border-2 transition-colors ${removeWhite ? "bg-white border-slate-200" : "bg-transparent border-slate-500"}`}
+                      ></div>
+                      <span className="font-black text-xs uppercase tracking-widest">
+                        إزالة الخلفية البيضاء
+                      </span>
+                    </div>
+                    <div
+                      className={`w-10 h-5 rounded-full relative transition-colors ${removeWhite ? "bg-slate-200" : "bg-slate-700"}`}
+                    >
+                      <div
+                        className={`absolute top-1 w-3 h-3 bg-slate-900 rounded-full transition-all ${removeWhite ? "right-6" : "right-1"}`}
+                      ></div>
+                    </div>
+                  </div>
+                </button>
+
+                <button
+                  onClick={() => setIsVapInput(!isVapInput)}
+                  className={`w-full p-5 rounded-2xl border transition-all flex items-center justify-between group ${isVapInput ? "bg-sky-500/10 border-sky-500/30 text-sky-400" : "bg-white/5 border-white/5 text-slate-500"}`}
+                >
+                  <div className="flex items-center gap-3">
+                    <Video
+                      className={`w-5 h-5 transition-colors ${isVapInput ? "text-sky-400" : "text-slate-500"}`}
+                    />
+                    <span className="font-black text-xs uppercase tracking-widest">
+                      فيديو VAP (مدخل)
+                    </span>
+                  </div>
+                  <div
+                    className={`w-10 h-5 rounded-full relative transition-colors ${isVapInput ? "bg-sky-500" : "bg-slate-700"}`}
+                  >
+                    <div
+                      className={`absolute top-1 w-3 h-3 bg-white rounded-full transition-all ${isVapInput ? "right-6" : "right-1"}`}
+                    ></div>
+                  </div>
+                </button>
+                <p className="text-[9px] text-slate-500 mt-2 text-right px-2">
+                  {isVapInput &&
+                    "تفعيل هذا الخيار إذا كان الفيديو المدخل بتنسيق VAP (نصف شفاف ونصف ألوان)."}
+                </p>
+              </div>
+
+              {/* Universal Tolerance Slider */}
+              {(removeWhite || removeBlack || removeGreen || removeBlue) && (
+                <div className="pt-4 border-t border-white/10 mt-2">
+                  <div className="flex justify-between text-[9px] font-black text-slate-400 mb-2">
+                    <span>الحساسية (Tolerance)</span>
+                    <span className="text-sky-400">{whiteTolerance}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="1"
+                    max="100"
+                    value={whiteTolerance}
+                    onChange={(e) =>
+                      setWhiteTolerance(parseInt(e.target.value))
+                    }
+                    className="w-full h-1.5 bg-white/10 rounded-lg appearance-none cursor-pointer accent-sky-500"
+                  />
+                  <p className="text-[8px] text-slate-500 mt-2 text-right">
+                    {removeBlack && "يتحكم في درجة السواد التي يتم إزالتها."}
+                    {removeGreen && "يتحكم في دقة عزل اللون الأخضر."}
+                    {removeWhite && "يتحكم في درجة البياض التي يتم إزالتها."}
+                  </p>
+                </div>
+              )}
+
+              {/* Edge Fade Sliders */}
+              <div className="space-y-6 pt-4 border-t border-white/5">
+                <h5 className="text-slate-400 text-[10px] font-black uppercase tracking-widest mb-4 flex items-center gap-2">
+                  <Layers className="w-3 h-3" />
+                  تدرج الشفافية (Edge Fade)
+                </h5>
+                <div className="grid grid-cols-2 gap-6">
+                  {["top", "bottom", "left", "right"].map((dir) => (
+                    <div key={dir} className="space-y-3">
+                      <div className="flex justify-between text-[9px] font-black text-slate-500 uppercase">
+                        <span>
+                          {dir === "top"
+                            ? "أعلى"
+                            : dir === "bottom"
+                              ? "أسفل"
+                              : dir === "left"
+                                ? "يسار"
+                                : "يمين"}
+                        </span>
+                        <span className="text-sky-400">
+                          {fadeConfig[dir as keyof typeof fadeConfig]}%
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min="0"
+                        max="50"
+                        value={fadeConfig[dir as keyof typeof fadeConfig]}
+                        onChange={(e) =>
+                          setFadeConfig({
+                            ...fadeConfig,
+                            [dir]: parseInt(e.target.value),
+                          })
+                        }
+                        className="w-full h-1 bg-white/5 rounded-lg appearance-none cursor-pointer accent-sky-500"
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Right Column: Action & Progress */}
+          <div className="xl:col-span-3 flex flex-col justify-between gap-6">
+            <div className="bg-gradient-to-br from-sky-500/10 to-indigo-600/10 p-8 rounded-[3rem] border border-sky-500/20 flex-1 flex flex-col items-center justify-center text-center">
+              <div
+                onClick={() => file && !isProcessing && extractAudio()}
+                className={`w-16 h-16 bg-sky-500/20 rounded-full flex items-center justify-center mb-6 border border-sky-500/30 transition-all ${file && !isProcessing ? "cursor-pointer hover:scale-110 active:scale-95 hover:bg-sky-500/30" : "opacity-50"}`}
+              >
+                <Download
+                  className={`w-8 h-8 text-sky-400 ${file && !isProcessing ? "animate-bounce" : ""}`}
+                />
+              </div>
+              <h3 className="text-white font-black text-lg mb-2">
+                جاهز للتحويل؟
+              </h3>
+              <p className="text-slate-400 text-[10px] leading-relaxed font-bold">
+                سيتم تطبيق كافة إعدادات الشفافية والمقياس مباشرة على الملف
+                الناتج.
+              </p>
+            </div>
+
+            <div className="space-y-4">
+              <div className="grid grid-cols-1 gap-4">
+                <button
+                  onClick={handleConvert}
+                  disabled={!file || isProcessing}
+                  className={`w-full py-6 rounded-[2.5rem] font-black text-lg transition-all active:scale-95 shadow-2xl flex items-center justify-center gap-3 ${!file || isProcessing ? "bg-slate-800 text-slate-600 cursor-not-allowed" : "bg-gradient-to-r from-sky-500 to-indigo-600 text-white shadow-glow-sky hover:shadow-glow-indigo"}`}
+                >
+                  {isProcessing ? (
+                    <>
+                      <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
+                      <span>جاري المعالجة...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Zap className="w-5 h-5 fill-white" />
+                      <span>ابدأ التحويل الآن</span>
+                    </>
+                  )}
+                </button>
+
+                <button
+                  onClick={extractAudio}
+                  disabled={!file || isProcessing}
+                  className={`w-full py-6 rounded-[2.5rem] font-black text-lg transition-all active:scale-95 flex items-center justify-center gap-3 ${!file || isProcessing ? "bg-slate-800 text-slate-600 cursor-not-allowed" : "bg-white/5 text-white border border-white/10 hover:bg-white/10"}`}
+                >
+                  <Music className="w-5 h-5" />
+                  <span>استخراج الصوت فقط</span>
+                </button>
+
+                <button
+                  onClick={() => handleTransferCurrentFileToAfterEffects()}
+                  disabled={!file || isProcessing || isTransferringToAe}
+                  className={`w-full py-4 rounded-[2.5rem] font-black text-sm transition-all active:scale-95 flex items-center justify-center gap-2 ${!file || isProcessing || isTransferringToAe ? "bg-slate-800 text-slate-600 cursor-not-allowed" : "bg-gradient-to-r from-purple-600/30 to-indigo-600/30 hover:from-purple-600/50 hover:to-indigo-600/50 text-purple-200 border border-purple-500/40 shadow-lg shadow-purple-950/30"}`}
+                >
+                  <Layers className="w-4 h-4 text-purple-300" />
+                  <span>نقل إلى مشروع After Effects</span>
+                  <Crown className="w-3.5 h-3.5 text-amber-400" />
+                </button>
+              </div>
+
+              <AnimatePresence>
+                {isProcessing && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: 10 }}
+                    className="bg-slate-950/60 p-6 rounded-[2rem] border border-white/5 space-y-4"
+                  >
+                    <div className="flex justify-between items-center">
+                      <span className="text-sky-400 font-black text-[10px] uppercase tracking-widest">
+                        {phase}
+                      </span>
+                      <span className="text-white font-black text-xs">
+                        {progress}%
+                      </span>
+                    </div>
+                    <div className="h-2 bg-white/5 rounded-full overflow-hidden p-0.5 border border-white/5">
+                      <motion.div
+                        initial={{ width: 0 }}
+                        animate={{ width: `${progress}%` }}
+                        className="h-full bg-gradient-to-r from-sky-500 to-indigo-500 rounded-full shadow-glow-sky"
+                      />
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Dedicated Zero-Crop Video Duration & Speed Compression Modal */}
+      <VideoDurationSpeedModal
+        isOpen={showDurationSpeedModal}
+        onClose={() => setShowDurationSpeedModal(false)}
+        initialFiles={files}
+        currentDuration={
+          timingSettings.mode === "fit_duration" && timingSettings.targetDuration > 0
+            ? timingSettings.targetDuration
+            : (targetSpeedDuration || duration || 10)
+        }
+        onApplyToConverter={(targetDur, speedMult) => {
+          setTargetSpeedDuration(targetDur);
+          setDurationMode("speed_fit");
+          setIsAutoDuration(false);
+          setTimingSettings({
+            ...DEFAULT_TIMING_SETTINGS,
+            mode: "fit_duration",
+            targetDuration: targetDur,
+            speedMultiplier: speedMult,
+            startTime: 0,
+            endTime: duration,
+          });
+        }}
+      />
+
+      {/* Advanced Video Trimmer & Variable Speed Studio Modal */}
+      {file && videoUrl && (
+        <VideoTrimmerModal
+          isOpen={showTrimmer}
+          onClose={() => setShowTrimmer(false)}
+          videoUrl={videoUrl}
+          videoFile={file}
+          initialDuration={duration}
+          initialSettings={timingSettings}
+          fps={fps}
+          onApply={(newSettings) => {
+            setTimingSettings(newSettings);
+            setStartTime(newSettings.startTime);
+            setEndTime(newSettings.endTime);
+            setIsAutoDuration(newSettings.mode === "full");
+          }}
+        />
+      )}
+
+      {/* Chroma Studio Eyedropper Modal */}
+      <ChromaStudioModal
+        isOpen={showChromaStudio}
+        onClose={() => setShowChromaStudio(false)}
+        videoUrl={videoUrl}
+        videoFile={file}
+        initialSettings={customChroma}
+        onApply={(newSettings) => {
+          setCustomChroma(newSettings);
+        }}
+        isVapInput={isVapInput}
+      />
+
+      {/* Transfer to After Effects / SVGA Layer Editor Live Progress Modal */}
+      <AnimatePresence>
+        {isTransferringToAe && (
+          <div className="fixed inset-0 z-[999] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="bg-slate-900 border border-purple-500/40 p-8 rounded-[2.5rem] max-w-lg w-full shadow-2xl shadow-purple-950/60 text-center space-y-6 relative overflow-hidden"
+            >
+              <div className="absolute -right-16 -top-16 w-48 h-48 bg-purple-600/20 rounded-full blur-3xl pointer-events-none" />
+              <div className="absolute -left-16 -bottom-16 w-48 h-48 bg-indigo-600/20 rounded-full blur-3xl pointer-events-none" />
+
+              <div className="w-16 h-16 rounded-2xl bg-gradient-to-tr from-purple-600 to-indigo-600 mx-auto flex items-center justify-center text-white shadow-xl shadow-purple-600/40">
+                {aeTransferSuccess ? (
+                  <CheckCircle2 className="w-8 h-8 text-emerald-300" />
+                ) : (
+                  <RefreshCw className="w-8 h-8 animate-spin text-purple-200" />
+                )}
+              </div>
+
+              <div>
+                <h3 className="text-white font-black text-xl flex items-center justify-center gap-2">
+                  <span>نقل المشروع إلى محرر الطبقات (After Effects)</span>
+                  <Crown className="w-4 h-4 text-amber-400" />
+                </h3>
+                <p className="text-slate-300 text-xs mt-2 font-medium">
+                  {aeTransferPhase}
+                </p>
+              </div>
+
+              {/* Progress bar */}
+              <div className="space-y-2">
+                <div className="flex justify-between text-xs font-bold px-1">
+                  <span className="text-purple-300 font-mono">التقدم الإجمالي</span>
+                  <span className="text-white font-mono">{aeTransferProgress}%</span>
+                </div>
+                <div className="h-3 bg-black/60 rounded-full overflow-hidden p-0.5 border border-white/10">
+                  <motion.div
+                    animate={{ width: `${aeTransferProgress}%` }}
+                    transition={{ ease: "easeOut", duration: 0.2 }}
+                    className="h-full bg-gradient-to-r from-purple-500 via-indigo-500 to-sky-400 rounded-full shadow-lg shadow-purple-500/50"
+                  />
+                </div>
+              </div>
+
+              {/* Badges of applied features */}
+              <div className="bg-black/40 p-4 rounded-2xl border border-white/5 space-y-2 text-right text-xs">
+                <div className="text-slate-400 font-bold text-[11px] mb-1">
+                  التعديلات المحفوظة والمنقولة للمشروع:
+                </div>
+                <div className="flex items-center gap-2 text-slate-200">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                  <span>إزالة الخلفية / كروما:</span>
+                  <strong className="text-emerald-300">
+                    {removeGreen ? "إزالة الخلفية الخضراء مفعلة ✓" : (customChroma?.enabled ? "كروما مخصصة ✓" : (removeBlack ? "إزالة الأسود ✓" : (removeWhite ? "إزالة الأبيض ✓" : "شفافية مخصصة")))}
+                  </strong>
+                </div>
+                <div className="flex items-center gap-2 text-slate-200">
+                  <span className="w-2 h-2 rounded-full bg-amber-400" />
+                  <span>قص وتحديد المدة:</span>
+                  <strong className="text-amber-300 font-mono">
+                    {calculateOutputDuration(duration, timingSettings).toFixed(2)} ثانية
+                  </strong>
+                </div>
+                <div className="flex items-center gap-2 text-slate-200">
+                  <span className="w-2 h-2 rounded-full bg-indigo-400" />
+                  <span>مزامنة الصوت والإطارات:</span>
+                  <strong className="text-indigo-300">
+                    {fps || 30} إطار/ثانية
+                  </strong>
+                </div>
+                <div className="flex items-center gap-2 text-slate-200 pt-1 border-t border-white/5">
+                  <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+                  <span>محرك المعالجة:</span>
+                  <strong className="text-amber-300 font-bold">
+                    Turbo Engine فائق السرعة ⚡
+                  </strong>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+    </>
+  );
+};

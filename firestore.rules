@@ -1,0 +1,104 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Global Helper Primitives
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128;
+    }
+
+    // Default Deny Catch-All
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 1. Gifts Collection: Publicly readable and writable with validation
+    match /gifts/{giftId} {
+      allow read: if isValidId(giftId);
+      allow create, update: if isValidId(giftId) &&
+        incoming().title is string && incoming().title.size() <= 250 &&
+        incoming().price is number && incoming().price >= 0;
+      allow delete: if isValidId(giftId);
+    }
+
+    // 2. Deliveries Collection: Readable & Writable with validation
+    match /deliveries/{deliveryId} {
+      allow read: if isValidId(deliveryId);
+      allow create, update: if isValidId(deliveryId) &&
+        incoming().orderId is string &&
+        incoming().price is number;
+      allow delete: if isValidId(deliveryId);
+    }
+
+    // 3. Employees Collection: Secure staff records & creator information
+    match /employees/{employeeId} {
+      allow read: if isValidId(employeeId);
+      allow create, update: if isValidId(employeeId) &&
+        incoming().name is string && incoming().name.size() <= 200;
+      allow delete: if isValidId(employeeId);
+    }
+
+    // 4. Users Accounts Collection
+    match /users/{userId} {
+      allow read: if isValidId(userId);
+      allow create, update: if isValidId(userId) &&
+        incoming().name is string;
+      allow delete: if isValidId(userId);
+    }
+
+    // 5. Banners Collection: Publicly readable for storefront, writable by staff
+    match /banners/{bannerId} {
+      allow read: if isValidId(bannerId);
+      allow create, update: if isValidId(bannerId) &&
+        incoming().title is string;
+      allow delete: if isValidId(bannerId);
+    }
+
+    // 6. Categories Collection: Publicly readable for store navigation, writable by staff
+    match /categories/{categoryId} {
+      allow read: if isValidId(categoryId);
+      allow create, update: if isValidId(categoryId) &&
+        incoming().name is string;
+      allow delete: if isValidId(categoryId);
+    }
+
+    // 7. Site Settings Collection: Publicly readable, writable by staff
+    match /settings/{settingId} {
+      allow read: if isValidId(settingId);
+      allow create, update: if isValidId(settingId);
+      allow delete: if isValidId(settingId);
+    }
+
+    // 8. Media Assets Collection: Accessible and manageable by authenticated managers
+    match /assets/{assetId} {
+      allow read: if isValidId(assetId);
+      allow create, update: if isValidId(assetId) &&
+        incoming().hash is string &&
+        incoming().type is string &&
+        incoming().optimizedSize is number;
+      allow delete: if isValidId(assetId);
+    }
+
+    // 9. External Videos Collection: Top4toP and cloud storage video uploads registry
+    match /externalVideos/{videoId} {
+      allow read: if isValidId(videoId);
+      allow create, update: if isValidId(videoId) &&
+        incoming().fileName is string &&
+        incoming().uploadStatus is string &&
+        incoming().sha256Hash is string;
+      allow delete: if isValidId(videoId);
+    }
+  }
+}
