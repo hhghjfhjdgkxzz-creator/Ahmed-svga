@@ -649,6 +649,8 @@ export const Dashboard: React.FC<DashboardProps> = ({
       await saveMediaToIndexedDb(uploadRes.url, file, safeName);
       setPosterUrl(uploadRes.url);
       setUsePosterImage(true);
+      setShapeEditorImage(uploadRes.url);
+      setIsShapeEditorOpen(true);
       if (!videoUrl) {
         setVideoUrl(uploadRes.url);
       }
@@ -658,6 +660,8 @@ export const Dashboard: React.FC<DashboardProps> = ({
         if (typeof reader.result === 'string') {
           setPosterUrl(reader.result);
           setUsePosterImage(true);
+          setShapeEditorImage(reader.result);
+          setIsShapeEditorOpen(true);
           if (!videoUrl) {
             setVideoUrl(reader.result);
           }
