@@ -34,6 +34,7 @@ const AuthModal = lazy(() => import('./components/AuthModal').then(m => ({ defau
 const SupportModal = lazy(() => import('./components/SupportModal').then(m => ({ default: m.SupportModal })));
 const VipModal = lazy(() => import('./components/VipModal').then(m => ({ default: m.VipModal })));
 const SiteSettingsModal = lazy(() => import('./components/SiteSettingsModal').then(m => ({ default: m.SiteSettingsModal })));
+import { AnimatedIntroModal } from './components/AnimatedIntroModal';
 
 export default function App() {
   // Language (Default to Arabic with instant RTL toggle)
@@ -674,6 +675,9 @@ ID الحساب: ${user.id}` : ''}
           )}
         </main>
       )}
+
+      {/* Animated 3D Intro Splash Screen */}
+      <AnimatedIntroModal lang={lang} logoUrl={siteSettings?.logoUrl} />
 
       {/* Footer */}
       <Footer
